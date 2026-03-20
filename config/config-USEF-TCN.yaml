@@ -1,0 +1,71 @@
+optimizer: !name:torch.optim.Adam
+    lr: 0.0001
+    weight_decay: 0
+
+checkpoint: 1
+# 指向我们刚刚用脚本剥离出来的、纯净的前端预训练权重
+continue_from: 'chkpt/tcn_init.pth.tar'
+max_norm: 5
+
+print_freq: 100
+# 更换存档目录，避免覆盖你珍贵的 SepFormer 权重
+name: USEF-TCN
+
+# 微调通常收敛极快，先设置 100 个 epoch 观察
+epochs: 100 
+batch_size: 4 
+num_workers: 8 
+valid_batch_size: 1
+
+num_spks: 1
+duration: 4
+sample_rate: 8000
+
+train_path: data/train/wsj0-2mix
+valid_path: data/dev/wsj0-2mix
+test_path: data/test/wsj0-2mix
+
+mix_scp: mix.scp
+ref_scp: ref.scp
+aux_scp: aux.scp
+
+# Encoder parameters
+N_encoder_out: 256
+out_channels: 256
+kernel_size: 16
+kernel_stride: 8
+embd: 256
+
+# Specifying the network (指向新建的 model_USEF_TCN 模块)
+Encoder: !new:models.model_USEF_TCN.Encoder
+    kernel_size: !ref <kernel_size>
+    out_channels: !ref <N_encoder_out>
+
+Decoder: !new:models.model_USEF_TCN.Decoder
+    in_channels: !ref <N_encoder_out>
+    out_channels: 1
+    kernel_size: !ref <kernel_size> 
+    stride: !ref <kernel_stride>
+    bias: False
+
+Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
+    num_layers: 4
+    d_model: !ref <out_channels>
+    nhead: 8
+    d_ffn: 1024
+    dropout: 0
+
+FiLM: !new:models.model_USEF_TCN.FiLM
+    size: !ref <out_channels>
+
+MaskNet: !new:models.model_USEF_TCN.Tar_Model
+    encoder: !ref <Encoder>
+    decoder: !ref <Decoder>
+    fusion_mdl: !ref <Fusion_mdl>
+    film: !ref <FiLM>
+    in_channels: !ref <N_encoder_out>
+    out_channels: !ref <out_channels>
+    num_spks: !ref <num_spks>
+
+modules:
+    masknet: !ref <MaskNet>
