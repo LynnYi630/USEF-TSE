@@ -4,7 +4,7 @@ optimizer: !name:torch.optim.Adam
 
 checkpoint: 1
 # 指向我们刚刚用脚本剥离出来的、纯净的前端预训练权重
-continue_from: 'chkpt/USEF-TCN/wsj0-2mix/epoch3.pth.tar'
+continue_from: 'chkpt/init_frontend.pth.tar'
 max_norm: 5
 
 print_freq: 100

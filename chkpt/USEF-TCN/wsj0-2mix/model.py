@@ -6,7 +6,6 @@ Oriented for low-latency edge device deployment.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import copy
 
 # === [修改 1/5]: 移除了 PositionalEncoding 的引入，因为 TCN 不需要绝对位置编码 ===
 
