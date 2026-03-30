@@ -52,6 +52,8 @@ class Tar_Model(nn.Module):
         in_channels,
         out_channels,
         num_spks=1,
+        mamba_layers=8,    # <--- [修改1] 新增参数：Mamba层数
+        d_state=64,        # <--- [修改1] 新增参数：SSM状态维度
         **kwargs 
     ):
         super(Tar_Model, self).__init__()
@@ -83,7 +85,7 @@ class Tar_Model(nn.Module):
         self.film = film
         
         # ==== 替换为 Mamba 后端 ====
-        self.backend = MambaBackend(in_channels=out_channels, num_layers=6)
+        self.backend = MambaBackend(in_channels=out_channels, num_layers=mamba_layers, d_state=d_state)
 
     def forward(self, input, aux):
         # 1. 编码器分别提取混合语音和参考声纹特征

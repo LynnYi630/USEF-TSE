@@ -16,12 +16,12 @@ kernel_size: 16
 kernel_stride: 8
 embd: 256
 
-# Specifying the network (指向新建的 model_USEF_Mamba 模块)
-Encoder: !new:models.model_USEF_Mamba.Encoder
+# Specifying the network (指向新建的 model_USEF_CausalTCN 模块)
+Encoder: !new:models.model_USEF_CausalTCN.Encoder
     kernel_size: !ref <kernel_size>
     out_channels: !ref <N_encoder_out>
 
-Decoder: !new:models.model_USEF_Mamba.Decoder
+Decoder: !new:models.model_USEF_CausalTCN.Decoder
     in_channels: !ref <N_encoder_out>
     out_channels: 1
     kernel_size: !ref <kernel_size> 
@@ -35,10 +35,10 @@ Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
     d_ffn: 1024
     dropout: 0
 
-FiLM: !new:models.model_USEF_Mamba.FiLM
+FiLM: !new:models.model_USEF_CausalTCN.FiLM
     size: !ref <out_channels>
 
-MaskNet: !new:models.model_USEF_Mamba.Tar_Model
+MaskNet: !new:models.model_USEF_CausalTCN.Tar_Model
     encoder: !ref <Encoder>
     decoder: !ref <Decoder>
     fusion_mdl: !ref <Fusion_mdl>
@@ -46,8 +46,6 @@ MaskNet: !new:models.model_USEF_Mamba.Tar_Model
     in_channels: !ref <N_encoder_out>
     out_channels: !ref <out_channels>
     num_spks: 1
-    mamba_layers: 8    # <--- 新增：将层数提升到 8 层 (算力充足甚至可试 10 层)
-    d_state: 64        # <--- 新增：将隐状态维度从 16 飙升到 64，极大增强因果记忆能力
 
 modules:
     masknet: !ref <MaskNet>
