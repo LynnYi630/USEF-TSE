@@ -1,14 +1,17 @@
 #!/bin/bash
 
-# 配置目标显存 (15GB = 15360MB)
-THRESHOLD=15360
-TARGET_SCRIPT="$HOME/USEF-TSE/eval.sh"
+# 配置目标显存 (MB)
+THRESHOLD=20480
+TARGET_SCRIPT="$HOME/usef/eval.sh"
+TARGET_DEVICE=0
 
 echo "已在当前环境执行监控..."
+echo "目标设备: ${TARGET_DEVICE}号卡, 目标显存阈值: ${THRESHOLD}MB"
+echo "目标脚本: ${TARGET_SCRIPT}"
 
 while true; do
     # 获取第 0 块显卡的显存
-    VRAM=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0)
+    VRAM=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $TARGET_DEVICE)
 
     if [ "$VRAM" -gt "$THRESHOLD" ]; then
         echo "✅ 显存达标 (${VRAM}MB)，开始执行脚本..."
@@ -20,7 +23,6 @@ while true; do
         echo "任务运行完毕。"
         break
     else
-       # echo "⏳ 当前显存 ${VRAM}MB，未达到 15GB。10秒后重试..."
-       sleep 1 
+       sleep 10 
     fi
 done

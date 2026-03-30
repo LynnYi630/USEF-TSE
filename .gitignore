@@ -1,5 +1,5 @@
 *.pth.tar
-*.log
+logs/
 *.scp
 # Byte-compiled / optimized / DLL files
 __pycache__/

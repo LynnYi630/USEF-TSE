@@ -58,6 +58,27 @@ class te_dataset(Dataset):
     def __len__(self):
         return self.len
 
+def reserve_gpu_memory(device_id=0, size_in_gb=10):
+    """
+    在训练开始前预占指定大小的 GPU 显存
+    """
+    print(f"尝试在 GPU {device_id} 上预占 {size_in_gb} GB 显存...")
+    try:
+        # 1 GB = 1024 * 1024 * 1024 Bytes
+        # 创建一个类型为 int8 (1 byte) 的空张量
+        dummy_tensor = torch.empty(size_in_gb * 1024**3, dtype=torch.int8, device=f'cuda:{device_id}')
+        
+        # 删除张量引用，显存会被释放到 PyTorch 的缓存池中
+        del dummy_tensor
+        
+        # 注意：千万不要调用 torch.cuda.empty_cache()！
+        # 否则显存会被立刻归还给操作系统，占座就失败了。
+        
+        print(f"成功预留 {size_in_gb} GB 显存。在 nvidia-smi 中应该已经能看到占用。")
+    except RuntimeError as e:
+        print(f"预占显存失败，可能是当前 GPU 剩余显存不足 {size_in_gb} GB。")
+        print(f"错误信息: {e}")
+
 def load_pretrained_modules(model, ckpt_path):
     model_info = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state_dict = OrderedDict()
@@ -69,7 +90,8 @@ def load_pretrained_modules(model, ckpt_path):
     return model
 
 def main(config, args):
-
+    # 在你初始化模型和加载数据之前调用它
+    reserve_gpu_memory(device_id=args.device, size_in_gb=args.memory)
     model = config['modules']['masknet']
     model = load_pretrained_modules(model,args.chkpt_path)
     model.cuda()
@@ -216,6 +238,8 @@ if __name__ == '__main__':
     # [修改] 默认值改为 None，以便程序判断你是否通过命令行显式指定了名称
     parser.add_argument('-l', '--log-file', type=str, default=None,
                         help='path to save the evaluation log file')
+    parser.add_argument('--device', default=0, type=int)
+    parser.add_argument('--memory', default=24, type=int)
     args = parser.parse_args()
 
     # ================= 新增的动态命名逻辑 =================

@@ -30,8 +30,30 @@ torch.backends.cudnn.benchmark = False
 
 torch.cuda.manual_seed_all(SEED)
 
+def reserve_gpu_memory(device_id=0, size_in_gb=10):
+    """
+    在训练开始前预占指定大小的 GPU 显存
+    """
+    print(f"尝试在 GPU {device_id} 上预占 {size_in_gb} GB 显存...")
+    try:
+        # 1 GB = 1024 * 1024 * 1024 Bytes
+        # 创建一个类型为 int8 (1 byte) 的空张量
+        dummy_tensor = torch.empty(size_in_gb * 1024**3, dtype=torch.int8, device=f'cuda:{device_id}')
+        
+        # 删除张量引用，显存会被释放到 PyTorch 的缓存池中
+        del dummy_tensor
+        
+        # 注意：千万不要调用 torch.cuda.empty_cache()！
+        # 否则显存会被立刻归还给操作系统，占座就失败了。
+        
+        print(f"成功预留 {size_in_gb} GB 显存。在 nvidia-smi 中应该已经能看到占用。")
+    except RuntimeError as e:
+        print(f"预占显存失败，可能是当前 GPU 剩余显存不足 {size_in_gb} GB。")
+        print(f"错误信息: {e}")
 
 def main(config, args):
+    # 在你初始化模型和加载数据之前调用它
+    reserve_gpu_memory(device_id=args.device, size_in_gb=args.memory)
 
     log_dir = os.path.join('logs', config['name'])
     os.makedirs(log_dir, exist_ok=True)
@@ -100,7 +122,7 @@ def main(config, args):
 
     model_params = list(filter(lambda p: p.requires_grad, model.parameters()))
     optimizer = config['optimizer'](params=model_params)
-    lr_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    lr_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8)
 
     trainer = Trainer(chkpt_dir = chkpt_dir,
                       data = data,
@@ -118,7 +140,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('Speech Separation: transformer')
     parser.add_argument('--config', default='config/config.yaml', type=str,
                         help='config file path (default: None)')
-    
+    parser.add_argument('--device', default=0, type=int)
+    parser.add_argument('--memory', default=24, type=int)
+
     args = parser.parse_args()
 
     # Read config of the whole system.
