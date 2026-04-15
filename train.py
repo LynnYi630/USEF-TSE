@@ -75,7 +75,8 @@ def main(config, args):
         ref_scp = os.path.join(config['train_path'], config['ref_scp']),
         aux_scp = os.path.join(config['train_path'], config['aux_scp']),
         dur = config['duration'],
-        fs = config['sample_rate']
+        fs = config['sample_rate'],
+        dataset_type = config.get('dataset_type', 'wsj0-2mix')
     )
 
     trainloader = DataLoader(

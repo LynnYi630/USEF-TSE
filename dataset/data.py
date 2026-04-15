@@ -6,7 +6,7 @@ import random
 import librosa
 
 class tr_dataset(Dataset):
-    def __init__(self, mix_scp, ref_scp, aux_scp, dur, fs):
+    def __init__(self, mix_scp, ref_scp, aux_scp, dur, fs, dataset_type):
         self.mix = {x.split()[0]:x.split()[1] for x in open(mix_scp)}
         self.ref = {x.split()[0]:x.split()[1] for x in open(ref_scp)}
         self.aux = {x.split()[0]:x.split()[1] for x in open(aux_scp)}
@@ -21,6 +21,7 @@ class tr_dataset(Dataset):
         
         self.fs = fs
         self.len = len(self.mix)
+        self.dataset_type = dataset_type
     
     def _trun_wav(self, y, tlen, offset=0):
         if y.shape[0] < tlen:
@@ -41,11 +42,40 @@ class tr_dataset(Dataset):
         utt = self.wav_id[index]
         mix_wav_path = self.mix[utt]
         target_wav_path = self.ref[utt]
-        # exclude = [utt.split('_')[0]+'.wav', utt.split('_')[2]+'.wav']
-        # aux_list = os.listdir(os.path.dirname(self.aux[utt]))
-        # aux_wav_path = os.path.join(os.path.dirname(self.aux[utt]), random.choice([x for x in aux_list if x not in exclude]))
-        aux_wav_path = self.aux[utt]
-        
+        # 根据数据集决定 exclude 策略
+        if self.dataset_type == "wsj0-2mix":
+            exclude = [utt.split('_')[0]+'.wav', utt.split('_')[2]+'.wav']
+            aux_list = os.listdir(os.path.dirname(self.aux[utt]))
+            valid_aux = [x for x in aux_list if x not in exclude]
+
+        elif self.dataset_type == "libri2mix":
+            # 1. 提取当前 Target 说话人的 ID
+            spk_id = utt.split('-')[0]
+            
+            # 2. 提取当前文件的真实文件名，用于排除自身
+            current_file = os.path.basename(target_wav_path)
+            
+            # 3. 获取 s1 目录下的所有文件
+            aux_list = os.listdir(os.path.dirname(self.aux[utt]))
+            
+            # 4. 核心过滤：文件名必须以该 spk_id 开头，且不能是当前正在训练的这段音频
+            valid_aux = [
+                x for x in aux_list 
+                if x.startswith(spk_id + '-') and x != current_file
+            ]
+            
+        else:
+            raise ValueError(f"Unsupported dataset type: {self.dataset_type}")
+
+        # 安全的随机挑选逻辑（防崩溃兜底）
+        if len(valid_aux) > 0:
+            chosen_aux = random.choice(valid_aux)
+        else:
+            # 如果该说话人在这个目录下恰好只有这一段音频，只能拿自己当 aux
+            chosen_aux = os.path.basename(self.aux[utt])
+            
+        aux_wav_path = os.path.join(os.path.dirname(self.aux[utt]), chosen_aux)
+
         mix_wav, _ = librosa.load(mix_wav_path, sr=self.fs)
         target_wav, _ = librosa.load(target_wav_path, sr=self.fs)
         aux_wav, _ = librosa.load(aux_wav_path, sr=self.fs)

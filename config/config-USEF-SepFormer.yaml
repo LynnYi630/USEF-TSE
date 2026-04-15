@@ -24,6 +24,7 @@ num_spks: 1
 duration: 4
 sample_rate: 8000
 
+dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
 train_path: data/train/wsj0-2mix
 valid_path: data/dev/wsj0-2mix
 test_path: data/test/wsj0-2mix
