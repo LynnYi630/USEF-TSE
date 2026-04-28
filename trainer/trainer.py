@@ -28,6 +28,15 @@ class Trainer(object):
         self.continue_from = config['continue_from']
         # logging
         self.print_freq = config['print_freq']
+        self.freeze_frontend_warmup = bool(
+            config.get('freeze_frontend_warmup', bool(self.continue_from))
+        )
+        self.frontend_warmup_epochs = int(config.get('frontend_warmup_epochs', 10))
+        self.frontend_unfreeze_lr_scale = float(
+            config.get('frontend_unfreeze_lr_scale', 0.1)
+        )
+        if self.frontend_warmup_epochs < 0:
+            raise ValueError('frontend_warmup_epochs must be >= 0')
         os.makedirs(self.save_folder, exist_ok=True)
         self.best_val_loss = float("inf")
         self.start_epoch = 0
@@ -160,24 +169,41 @@ class Trainer(object):
         return total_loss / (i + 1)
     
     def train(self):
-        # 设定解冻的 Epoch 节点（例如前 10 个 Epoch 冻结，第 11 个开始解冻）
-        UNFREEZE_EPOCH = 10 
+        # 前端冻结 warm-up 由 config 控制。
 
         # Train model multi-epoches
         for epoch in range(self.start_epoch, self.epochs):
 
             # ===== [新增 2/2]：在每一个 Epoch 开始前，根据状态机判断是否需要解冻 =====
-            if epoch < UNFREEZE_EPOCH:
+            if (
+                self.freeze_frontend_warmup
+                and self.frontend_warmup_epochs > 0
+                and epoch < self.frontend_warmup_epochs
+            ):
                 self._freeze_frontend()
-            elif epoch == UNFREEZE_EPOCH:
+            elif (
+                self.freeze_frontend_warmup
+                and self.frontend_warmup_epochs > 0
+                and epoch == self.frontend_warmup_epochs
+            ):
                 self._unfreeze_frontend()
                 # 首次解冻时，将学习率衰减，防止破坏前端的预训练权重
                 for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = param_group['lr'] * 0.1
-                self.logger.info("-> [学习率调整] 解冻前端，整体学习率已自动衰减至原来的 10%。")
-            elif epoch > UNFREEZE_EPOCH:
+                    param_group['lr'] *= self.frontend_unfreeze_lr_scale
+                self.logger.info(
+                    "-> [学习率调整] 解冻前端，整体学习率已乘以 %.4g。"
+                    % self.frontend_unfreeze_lr_scale
+                )
+            elif (
+                self.freeze_frontend_warmup
+                and self.frontend_warmup_epochs > 0
+                and epoch > self.frontend_warmup_epochs
+            ):
                 self._unfreeze_frontend() # 确保断点恢复后依然是解冻状态
             # ===================================================================
+
+            else:
+                self._unfreeze_frontend()
 
             optim_state = self.optimizer.state_dict()
             self.logger.info('epoch start Learning rate: {lr:.6f}'.format(lr=optim_state['param_groups'][0]['lr']))
