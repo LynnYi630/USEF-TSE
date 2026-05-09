@@ -1,0 +1,110 @@
+optimizer: !name:torch.optim.Adam
+  lr: 0.0001
+  weight_decay: 0
+
+checkpoint: 1
+continue_from: 'chkpt/init_frontend_from_sepformer_libri2mix_for_tcctcn.pth.tar'
+max_norm: 5
+print_freq: 100
+name: USEF-TCCTCN-SafeCond/libri2mix
+
+# frontend freezing control
+freeze_frontend_warmup: False
+frontend_warmup_epochs: 10
+frontend_unfreeze_lr_scale: 0.1
+
+epochs: 200
+batch_size: 2
+num_workers: 8
+valid_batch_size: 1
+num_spks: 1
+
+duration: 4
+sample_rate: 8000
+# Validation-only controls:
+# valid_chunk_* makes trainer validation run long mixtures in chunks to reduce GPU memory.
+# valid_wake_aux_duration caps the enrollment/aux audio length passed by te_dataset.
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
+valid_wake_aux_duration: 4
+
+# Replace these three paths with your own Libri2Mix / WSJ0-2mix list directories.
+# Each directory should contain mix.scp, ref.scp, and aux.scp.
+dataset_type: libri2mix  # [wsj0-2mix, libri2mix]
+train_path: data/train/libri2mix
+valid_path: data/dev/libri2mix
+test_path: data/test/libri2mix
+
+mix_scp: mix.scp
+ref_scp: ref.scp
+aux_scp: aux.scp
+
+# Encoder parameters
+N_encoder_out: 256
+out_channels: 256
+encoder_kernel_size: 16
+encoder_kernel_stride: 8
+embd: 256
+
+# Target-Conditioned Causal TCN backend parameters
+tc_conv_channels: 512
+tc_kernel_size: 3
+tc_num_blocks: 8
+tc_num_repeats: 3
+tc_dropout: 0.0
+use_gated_residual_film: True
+
+# Target-Conditioned Causal TCN V2 backend parameters
+tc_cond_scale_init: 0.1
+tc_cond_scale_trainable: True
+tc_zero_init_cond_proj: True
+reset_tc_conditioning_on_continue: True
+
+# Penalize estimates that become too similar to the non-target residual
+# mixture - target. This is aimed at reducing target-swap failures.
+lambda_anti: 0.05
+anti_sisnr_margin: 0.0
+
+# Specifying the network
+Encoder: !new:models.model_USEF_TCCTCN.Encoder
+  kernel_size: !ref <encoder_kernel_size>
+  out_channels: !ref <N_encoder_out>
+
+Decoder: !new:models.model_USEF_TCCTCN.Decoder
+  in_channels: !ref <N_encoder_out>
+  out_channels: 1
+  kernel_size: !ref <encoder_kernel_size>
+  stride: !ref <encoder_kernel_stride>
+  bias: False
+
+Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
+  num_layers: 4
+  d_model: !ref <out_channels>
+  nhead: 8
+  d_ffn: 1024
+  dropout: 0
+  # normalize_before: True
+
+FiLM: !new:models.model_USEF_TCCTCN.FiLM
+  size: !ref <out_channels>
+
+MaskNet: !new:models.model_USEF_TCCTCN.Tar_Model
+  encoder: !ref <Encoder>
+  decoder: !ref <Decoder>
+  fusion_mdl: !ref <Fusion_mdl>
+  film: !ref <FiLM>
+  in_channels: !ref <N_encoder_out>
+  out_channels: !ref <out_channels>
+  num_spks: !ref <num_spks>
+  conv_channels: !ref <tc_conv_channels>
+  kernel_size: !ref <tc_kernel_size>
+  num_blocks: !ref <tc_num_blocks>
+  num_repeats: !ref <tc_num_repeats>
+  dropout: !ref <tc_dropout>
+  use_gated_residual_film: !ref <use_gated_residual_film>
+  cond_scale_init: !ref <tc_cond_scale_init>
+  cond_scale_trainable: !ref <tc_cond_scale_trainable>
+  zero_init_cond_proj: !ref <tc_zero_init_cond_proj>
+
+modules:
+  masknet: !ref <MaskNet>

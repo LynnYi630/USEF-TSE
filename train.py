@@ -9,6 +9,7 @@ import time
 import random
 import shutil
 import inspect
+import re
 
 from hyperpyyaml import load_hyperpyyaml
 from torch.utils.data.distributed import DistributedSampler
@@ -51,7 +52,50 @@ def reserve_gpu_memory(device_id=0, size_in_gb=10):
         print(f"预占显存失败，可能是当前 GPU 剩余显存不足 {size_in_gb} GB。")
         print(f"错误信息: {e}")
 
+def apply_dataset_args(config, args):
+    if args.dataset is None:
+        return
+
+    dataset = args.dataset
+    data_root = args.data_root
+    config['dataset_type'] = dataset
+    config['train_path'] = os.path.join(data_root, 'train', dataset)
+    config['valid_path'] = os.path.join(data_root, 'dev', dataset)
+    config['test_path'] = os.path.join(data_root, 'test', dataset)
+
+    exp_name = str(config.get('name', 'experiment')).split('/')[0]
+    config['name'] = f'{exp_name}/{dataset}'
+
+
+def copy_effective_config(src_path, dst_path, args, config):
+    if args.dataset is None:
+        shutil.copyfile(src_path, dst_path)
+        return
+
+    with open(src_path, 'r', encoding='utf-8') as f:
+        config_text = f.read()
+
+    replacements = {
+        'name': config['name'],
+        'dataset_type': config['dataset_type'],
+        'train_path': config['train_path'],
+        'valid_path': config['valid_path'],
+        'test_path': config['test_path'],
+    }
+    for key, value in replacements.items():
+        pattern = r'^{}:\s*.*$'.format(re.escape(key))
+        line = f'{key}: {value}'
+        config_text, count = re.subn(pattern, line, config_text, count=1, flags=re.MULTILINE)
+        if count == 0:
+            config_text += f'\n{line}\n'
+
+    with open(dst_path, 'w', encoding='utf-8') as f:
+        f.write(config_text)
+
+
 def main(config, args):
+    apply_dataset_args(config, args)
+
     # 在你初始化模型和加载数据之前调用它
     reserve_gpu_memory(device_id=args.device, size_in_gb=args.memory)
 
@@ -76,7 +120,13 @@ def main(config, args):
         aux_scp = os.path.join(config['train_path'], config['aux_scp']),
         dur = config['duration'],
         fs = config['sample_rate'],
-        dataset_type = config.get('dataset_type', 'wsj0-2mix')
+        dataset_type = config.get('dataset_type', 'wsj0-2mix'),
+        use_short_aux = config.get('use_short_aux', False),
+        use_wrcd = config.get('use_wrcd', False),
+        use_wrcd_consistency = config.get('use_wrcd_consistency', False),
+        teacher_cache_dir = config.get('teacher_cache_dir', None),
+        wake_aux_min_duration = config.get('train_wake_aux_min_duration', config.get('train_wake_aux_duration', 1.0)),
+        wake_aux_max_duration = config.get('train_wake_aux_max_duration', config.get('train_wake_aux_duration', 1.0)),
     )
 
     trainloader = DataLoader(
@@ -92,7 +142,8 @@ def main(config, args):
         mix_scp = os.path.join(config['valid_path'], config['mix_scp']),
         ref_scp = os.path.join(config['valid_path'], config['ref_scp']),
         aux_scp = os.path.join(config['valid_path'], config['aux_scp']),
-        fs = config['sample_rate']
+        fs = config['sample_rate'],
+        aux_duration = config.get('valid_wake_aux_duration', None),
     )
 
     validloader = DataLoader(
@@ -118,7 +169,7 @@ def main(config, args):
     chkpt_dir = os.path.join('chkpt', config['name'])
     os.makedirs(chkpt_dir, exist_ok=True)
 
-    shutil.copyfile(args.config, os.path.join(chkpt_dir, 'config.yaml'))
+    copy_effective_config(args.config, os.path.join(chkpt_dir, 'config.yaml'), args, config)
     shutil.copyfile(inspect.getmodule(config['MaskNet'].__class__).__file__, os.path.join(chkpt_dir, 'model.py'))
 
     model_params = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -143,6 +194,10 @@ if __name__ == '__main__':
                         help='config file path (default: None)')
     parser.add_argument('--device', default=0, type=int)
     parser.add_argument('--memory', default=24, type=int)
+    parser.add_argument('--dataset', default=None, choices=['wsj0-2mix', 'libri2mix'],
+                        help='override dataset paths with data/{train,dev,test}/<dataset>')
+    parser.add_argument('--data-root', default='data', type=str,
+                        help='root directory containing train/dev/test dataset folders')
 
     args = parser.parse_args()
 

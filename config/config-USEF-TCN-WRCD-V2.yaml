@@ -3,33 +3,50 @@ optimizer: !name:torch.optim.Adam
     weight_decay: 0
 
 checkpoint: 1
-continue_from: 'chkpt/init_frontend.pth.tar'
+continue_from: 'chkpt/USEF-TCN-WRCD/libri2mix/epoch100.pth.tar'
 max_norm: 5
 print_freq: 100
-name: USEF-TCN/wsj0-2mix
+name: USEF-TCN-WRCD/libri2mix
 
 # frontend freezing control
 freeze_frontend_warmup: False
 frontend_warmup_epochs: 10
 frontend_unfreeze_lr_scale: 0.1
 
-epochs: 100 
-batch_size: 2 
-num_workers: 8 
-valid_batch_size: 1 
+epochs: 200
+batch_size: 2
+num_workers: 8
+valid_batch_size: 1
 
-num_spks: 1 
-duration: 4 
-sample_rate: 8000 
+num_spks: 1
+duration: 4
+sample_rate: 8000
+# Validation-only controls:
+# valid_chunk_* makes trainer validation run long mixtures in chunks to reduce GPU memory.
+# valid_wake_aux_duration caps the enrollment/aux audio length passed by te_dataset.
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
 
-dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
-train_path: data/train/wsj0-2mix
-valid_path: data/dev/wsj0-2mix
-test_path: data/test/wsj0-2mix
+dataset_type: libri2mix  # [wsj0-2mix, libri2mix]
+train_path: data/train/libri2mix
+valid_path: data/dev/libri2mix
+test_path: data/test/libri2mix
 
 mix_scp: mix.scp
 ref_scp: ref.scp
 aux_scp: aux.scp
+
+# WRCD-V2: short wake-word aux/enrollment + waveform teacher distillation + aux consistency.
+use_short_aux: True
+use_wrcd: True
+use_wrcd_consistency: True # V2
+teacher_cache_dir: teacher_cache/USEF-SepFormer/libri2mix/train
+lambda_kd: 0.2
+lambda_cons: 0.05 # V2
+
+# Keep min=max for the first run. Use 0.5 / 1.0 / 1.5 as separate ablations.
+train_wake_aux_duration: 1.0
+valid_wake_aux_duration: 1.0
 
 # Encoder parameters
 N_encoder_out: 256
@@ -38,7 +55,6 @@ kernel_size: 16
 kernel_stride: 8
 embd: 256
 
-# Specifying the network (指向新建的 model_USEF_TCN 模块)
 Encoder: !new:models.model_USEF_TCN.Encoder
     kernel_size: !ref <kernel_size>
     out_channels: !ref <N_encoder_out>
@@ -46,7 +62,7 @@ Encoder: !new:models.model_USEF_TCN.Encoder
 Decoder: !new:models.model_USEF_TCN.Decoder
     in_channels: !ref <N_encoder_out>
     out_channels: 1
-    kernel_size: !ref <kernel_size> 
+    kernel_size: !ref <kernel_size>
     stride: !ref <kernel_stride>
     bias: False
 

@@ -3,15 +3,16 @@ optimizer: !name:torch.optim.Adam
     weight_decay: 0
 
 checkpoint: 1
-# 指向我们刚刚用脚本剥离出来的、纯净的前端预训练权重
 continue_from: 'chkpt/init_frontend.pth.tar'
 max_norm: 5
-
 print_freq: 100
-# 更换存档目录，避免覆盖你珍贵的 SepFormer 权重
 name: USEF-CausalTCN/libri2mix
 
-# 微调通常收敛极快，先设置 100 个 epoch 观察
+# frontend freezing control
+freeze_frontend_warmup: False
+frontend_warmup_epochs: 10
+frontend_unfreeze_lr_scale: 0.1
+
 epochs: 100 
 batch_size: 6 
 num_workers: 8 

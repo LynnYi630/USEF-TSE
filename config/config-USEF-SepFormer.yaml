@@ -11,10 +11,6 @@ name: USEF-SepFormer/wsj0-2mix
 
 
 epochs: 200
-# batch_size: 2
-# num_workers: 2
-# valid_batch_size: 1
-# 官方默认是 2，5090 有 24/32G 显存，建议调大到 4 或 8 以加快训练
 batch_size: 2
 num_workers: 8 # 提升数据加载速度
 valid_batch_size: 1
@@ -23,6 +19,12 @@ valid_batch_size: 1
 num_spks: 1
 duration: 4
 sample_rate: 8000
+# Validation-only controls:
+# valid_chunk_* makes trainer validation run long mixtures in chunks to reduce GPU memory.
+# valid_wake_aux_duration caps the enrollment/aux audio length passed by te_dataset.
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
+valid_wake_aux_duration: 4
 
 dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
 train_path: data/train/wsj0-2mix

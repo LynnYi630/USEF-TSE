@@ -91,6 +91,7 @@ class TransformerEncoderLayer(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         pos_embs: Optional[torch.Tensor] = None,
+        return_attn_weights: bool = False,
     ):
         """
         Arguments
@@ -108,14 +109,20 @@ class TransformerEncoderLayer(nn.Module):
         else:
             src1 = src
 
-        output, self_attn = self.self_att(
+        attn_output = self.self_att(
             src1,
             src1,
             src1,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
+            return_attn_weights=return_attn_weights,
             pos_embs=pos_embs,
         )
+        if return_attn_weights:
+            output, self_attn = attn_output
+        else:
+            output = attn_output
+            self_attn = None
 
         # add & norm
         src = src + self.dropout1(output)
@@ -213,6 +220,7 @@ class TransformerEncoder(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         pos_embs: Optional[torch.Tensor] = None,
+        return_attn_weights: bool = False,
     ):
         """
         Arguments
@@ -224,6 +232,9 @@ class TransformerEncoder(nn.Module):
         src_key_padding_mask : tensor
             The mask for the src keys per batch (optional).
         """
+        # Debug/visualization entry point:
+        # keep return_attn_weights=False during normal training/eval to avoid
+        # storing large attention maps; set True only for a few diagnostic cases.
         output = src
         if self.layerdrop_prob > 0.0:
             keep_probs = self.rng.random(len(self.layers))
@@ -241,8 +252,10 @@ class TransformerEncoder(nn.Module):
                     src_mask=src_mask,
                     src_key_padding_mask=src_key_padding_mask,
                     pos_embs=pos_embs,
+                    return_attn_weights=return_attn_weights,
                 )
 
-                attention_lst.append(attention)
+                if attention is not None:
+                    attention_lst.append(attention)
         output = self.norm(output)
         return output, attention_lst

@@ -2,32 +2,61 @@
 
 import os
 import time
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
-from utils.losses import batchMean_sisnrLoss
+from utils.losses import batchMean_sisnrLoss, sisnr
+
 
 class Trainer(object):
-    
+    """训练主循环。
+
+    这个 Trainer 目前承载了几条相互独立的实验改进：
+    1. WRCD-V2：短 wake aux/enrollment、teacher waveform KD、双 aux 一致性约束。
+    2. TCCTCN-V2：target-conditioned TCN 的 conditioning reset，以及 anti-interferer SI-SNR loss。
+    3. Valid chunking：validation 阶段按块跑长语音，避免 SepFormer/Cross-Attention OOM。
+
+    """
+
     def __init__(self, chkpt_dir, data, model, optimizer, scheduler, logger, config):
         self.tr_loader = data['tr_loader']
         self.cv_loader = data['cv_loader']
-        
+
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.logger = logger
 
-        # Training config
+        # ===== 通用训练配置：所有模型共享 =====
         self.epochs = config['epochs']
         self.max_norm = config['max_norm']
-        self.logger = logger
-        # save and load model
         self.save_folder = chkpt_dir
         self.checkpoint = config['checkpoint']
         self.continue_from = config['continue_from']
-        # logging
         self.print_freq = config['print_freq']
+        os.makedirs(self.save_folder, exist_ok=True)
+
+        self.best_val_loss = float("inf")
+        self.start_epoch = 0
+
+        # ===== Valid chunking：只影响 validation，不影响训练和 eval.py =====
+        # 目的：CV 阶段数据集可以返回全长语音，但模型按 chunk 前向，降低 attention 显存峰值。
+        # 默认使用训练 duration 作为 chunk 长度；如果配置 valid_chunk_duration <= 0，则关闭分块。
+        self.sample_rate = int(config.get('sample_rate', 0))
+        self.valid_chunk_duration = float(
+            config.get('valid_chunk_duration', config.get('duration', 0))
+        )
+        self.valid_chunk_hop_duration = float(
+            config.get('valid_chunk_hop_duration', self.valid_chunk_duration)
+        )
+        self.valid_chunk_len = 0
+        self.valid_chunk_hop = 0
+        self._init_valid_chunking()
+
+        # ===== 通用迁移学习 warm-up：冻结/解冻前端 =====
+        # 这块不专属于 WRCD 或 TCCTCN；用于继续训练时先保护 encoder/decoder/fusion/FiLM。
         self.freeze_frontend_warmup = bool(
             config.get('freeze_frontend_warmup', bool(self.continue_from))
         )
@@ -35,229 +64,482 @@ class Trainer(object):
         self.frontend_unfreeze_lr_scale = float(
             config.get('frontend_unfreeze_lr_scale', 0.1)
         )
+
+        # ===== WRCD-V2：teacher KD + wake aux consistency =====
+        # use_wrcd: 训练 batch 会额外带 teacher waveform。
+        # use_wrcd_consistency: 训练 batch 会再额外带第二个 wake aux，用于一致性约束。
+        self.use_wrcd = bool(config.get('use_wrcd', False))
+        self.use_wrcd_consistency = bool(config.get('use_wrcd_consistency', False))
+        self.lambda_kd = float(config.get('lambda_kd', 0.0))
+        self.lambda_cons = float(config.get('lambda_cons', 0.0))
+
+        # ===== TCCTCN-V2：target-conditioned TCN 专用逻辑 =====
+        # lambda_anti: 抑制模型靠近干扰说话人，缓解 target-swap。
+        # reset_tc_conditioning_on_continue: 从旧 checkpoint 迁移时重置新加的 conditioning path。
+        self.lambda_anti = float(config.get('lambda_anti', 0.0))
+        self.anti_sisnr_margin = float(config.get('anti_sisnr_margin', 0.0))
+        self.reset_tc_conditioning_on_continue = bool(
+            config.get('reset_tc_conditioning_on_continue', False)
+        )
+        self.tc_cond_scale_init = float(config.get('tc_cond_scale_init', 1.0))
+        self.tc_zero_init_cond_proj = bool(config.get('tc_zero_init_cond_proj', False))
+
+        self._validate_config()
+
+        if self.valid_chunk_len > 0:
+            self.logger.info(
+                'Validation chunking enabled: chunk %.2fs, hop %.2fs'
+                % (self.valid_chunk_duration, self.valid_chunk_hop_duration)
+            )
+
+        if self.continue_from:
+            self._load_checkpoint()
+
+    # -------------------------------------------------------------------------
+    # 配置校验与 checkpoint 加载
+    # -------------------------------------------------------------------------
+    def _init_valid_chunking(self):
+        """[Valid chunking] 将秒级配置换算成采样点。"""
+        if self.valid_chunk_duration <= 0:
+            return
+        if self.sample_rate <= 0:
+            raise ValueError('sample_rate is required for valid chunking')
+
+        self.valid_chunk_len = int(round(self.valid_chunk_duration * self.sample_rate))
+        self.valid_chunk_hop = int(round(self.valid_chunk_hop_duration * self.sample_rate))
+        if self.valid_chunk_len <= 0 or self.valid_chunk_hop <= 0:
+            raise ValueError('valid chunk duration and hop must be positive')
+        if self.valid_chunk_hop > self.valid_chunk_len:
+            raise ValueError('valid_chunk_hop_duration must be <= valid_chunk_duration')
+
+    def _validate_config(self):
+        """配置合法性检查。"""
+        if self.lambda_kd < 0:
+            raise ValueError('lambda_kd must be >= 0')
+        if self.lambda_cons < 0:
+            raise ValueError('lambda_cons must be >= 0')
+        if self.lambda_anti < 0:
+            raise ValueError('lambda_anti must be >= 0')
         if self.frontend_warmup_epochs < 0:
             raise ValueError('frontend_warmup_epochs must be >= 0')
-        os.makedirs(self.save_folder, exist_ok=True)
-        self.best_val_loss = float("inf")
-        self.start_epoch = 0
-        
-        if self.continue_from:
-            print('Loading checkpoint model %s' % self.continue_from)
-            # 加上 weights_only=False 规避 PyTorch 2.6 安全报错
-            cont = torch.load(self.continue_from, weights_only=False) 
-            self.start_epoch = cont.get('epoch', 0)
-            
-            # 核心：加上 strict=False 允许只加载部分匹配的权重（迁移学习必须）
-            self.model.load_state_dict(cont['model_state_dict'], strict=False)
-            
-            # 安全检查：只有当存在优化器状态且不为空时才加载
-            if 'optimizer_state' in cont and cont['optimizer_state'] is not None:
-                self.optimizer.load_state_dict(cont['optimizer_state'])
-                print("成功加载历史优化器状态。")
-            else:
-                print("未检测到优化器状态，将随机初始化优化器（适用于迁移学习启动）。")
-                
-            # 安全检查：随机数种子
-            if 'trandom_state' in cont and cont['trandom_state'] is not None:
-                torch.set_rng_state((cont['trandom_state']))
-            if 'nrandom_state' in cont and cont['nrandom_state'] is not None:
-                np.random.set_state((cont['nrandom_state']))
 
-    # ===== [新增 1/2]：前端模块的冻结与解冻控制函数 =====
+    def _load_checkpoint(self):
+        """通用 checkpoint 恢复；其中包含 TCCTCN-V2 的 conditioning reset。"""
+        print('Loading checkpoint model %s' % self.continue_from)
+        # PyTorch 2.6+ 默认 weights_only=True，旧 checkpoint 需要显式关闭。
+        cont = torch.load(self.continue_from, weights_only=False)
+        self.start_epoch = cont.get('epoch', 0)
+
+        # 通用迁移学习：strict=False 允许只加载形状匹配的旧权重。
+        self.model.load_state_dict(cont['model_state_dict'], strict=False)
+
+        # ===== TCCTCN-V2：迁移旧模型时重置 target-conditioned path =====
+        if self.reset_tc_conditioning_on_continue:
+            self._reset_tc_conditioning()
+
+        # 通用保护：如果 optimizer state 与当前模型不兼容，就跳过而不是中断训练。
+        if 'optimizer_state' in cont and cont['optimizer_state'] is not None:
+            try:
+                self.optimizer.load_state_dict(cont['optimizer_state'])
+                print("optimizer state loaded")
+            except ValueError as exc:
+                print("optimizer state is incompatible; reinitializing optimizer")
+                print("optimizer_state load error: {}".format(exc))
+        else:
+            print("未检测到优化器状态，将随机初始化优化器（适用于迁移学习启动）。")
+
+        if 'trandom_state' in cont and cont['trandom_state'] is not None:
+            torch.set_rng_state(cont['trandom_state'])
+        if 'nrandom_state' in cont and cont['nrandom_state'] is not None:
+            np.random.set_state(cont['nrandom_state'])
+
+    # -------------------------------------------------------------------------
+    # TCCTCN-V2：target-conditioned path 初始化/重置
+    # -------------------------------------------------------------------------
+    def _reset_tc_conditioning(self):
+        """[TCCTCN-V2] 重置新加的 conditioning path，避免旧 checkpoint 污染新结构。"""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        backend = getattr(model, 'tcn_backend', None)
+        blocks = getattr(backend, 'blocks', None)
+        if blocks is None:
+            return
+
+        for block in blocks:
+            cond_proj = getattr(block, 'cond_proj', None)
+            if cond_proj is not None and self.tc_zero_init_cond_proj:
+                nn.init.zeros_(cond_proj.weight)
+                nn.init.zeros_(cond_proj.bias)
+
+            cond_scale = getattr(block, 'cond_scale', None)
+            if cond_scale is not None:
+                with torch.no_grad():
+                    cond_scale.fill_(self.tc_cond_scale_init)
+
+        self.logger.info(
+            'Reset TCCTCN conditioning path after checkpoint load '
+            '(cond_scale_init=%.4f, zero_init_cond_proj=%s).'
+            % (self.tc_cond_scale_init, self.tc_zero_init_cond_proj)
+        )
+
+    # -------------------------------------------------------------------------
+    # 通用迁移学习：前端冻结/解冻 warm-up
+    # -------------------------------------------------------------------------
+    def _frontend_modules(self):
+        """返回需要 warm-up 冻结的前端模块，兼容 DataParallel。"""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        modules = []
+        for name in ('encoder', 'decoder', 'fusion_mdl', 'film'):
+            module = getattr(model, name, None)
+            if module is not None:
+                modules.append(module)
+        return modules
+
     def _freeze_frontend(self):
-        """冻结前端模块，仅训练后端（如Mamba/TCN）"""
+        """[通用 warm-up] 冻结前端模块，仅训练后端或新加模块。"""
         if getattr(self, '_frontend_frozen', False):
             return
-        modules_to_freeze = []
-        if hasattr(self.model, 'encoder'):
-            modules_to_freeze.extend([self.model.encoder, self.model.decoder, self.model.fusion_mdl, self.model.film])
-        elif hasattr(self.model, 'module') and hasattr(self.model.module, 'encoder'):
-            # 兼容 DataParallel 多卡并行模式
-            modules_to_freeze.extend([self.model.module.encoder, self.model.module.decoder, self.model.module.fusion_mdl, self.model.module.film])
-            
-        for module in modules_to_freeze:
+
+        for module in self._frontend_modules():
             for param in module.parameters():
                 param.requires_grad = False
-                
-        self.logger.info("==================================================")
-        self.logger.info("-> [状态切换] 前端模块已冻结，当前仅训练后端网络及掩码层。")
-        self.logger.info("==================================================")
+
+        self.logger.info("-> [状态切换] 前端模块已冻结，当前仅训练后端/新增模块。")
         self._frontend_frozen = True
         self._frontend_unfrozen = False
 
     def _unfreeze_frontend(self):
-        """解冻前端模块，开启全网络端到端微调"""
+        """[通用 warm-up] 解冻前端模块，进入全网络端到端训练。"""
         if getattr(self, '_frontend_unfrozen', False):
             return
-        modules_to_unfreeze = []
-        if hasattr(self.model, 'encoder'):
-            modules_to_unfreeze.extend([self.model.encoder, self.model.decoder, self.model.fusion_mdl, self.model.film])
-        elif hasattr(self.model, 'module') and hasattr(self.model.module, 'encoder'):
-            modules_to_unfreeze.extend([self.model.module.encoder, self.model.module.decoder, self.model.module.fusion_mdl, self.model.module.film])
-            
-        for module in modules_to_unfreeze:
+
+        for module in self._frontend_modules():
             for param in module.parameters():
                 param.requires_grad = True
-                
-        self.logger.info("==================================================")
+
         self.logger.info("-> [状态切换] 前端模块已解冻，模型进入全网络协同微调阶段。")
-        self.logger.info("==================================================")
         self._frontend_frozen = False
         self._frontend_unfrozen = True
-    # ===================================================
+
+    def _apply_frontend_schedule(self, epoch):
+        """[通用 warm-up] 每个 epoch 开始前决定是否冻结/解冻。"""
+        if (
+            self.freeze_frontend_warmup
+            and self.frontend_warmup_epochs > 0
+            and epoch < self.frontend_warmup_epochs
+        ):
+            self._freeze_frontend()
+            return
+
+        if (
+            self.freeze_frontend_warmup
+            and self.frontend_warmup_epochs > 0
+            and epoch == self.frontend_warmup_epochs
+        ):
+            self._unfreeze_frontend()
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] *= self.frontend_unfreeze_lr_scale
+            self.logger.info(
+                "-> [学习率调整] 解冻前端，整体学习率已乘以 %.4g。"
+                % self.frontend_unfreeze_lr_scale
+            )
+            return
+
+        if (
+            self.freeze_frontend_warmup
+            and self.frontend_warmup_epochs > 0
+            and epoch > self.frontend_warmup_epochs
+        ):
+            self._unfreeze_frontend()
+            return
+
+        self._unfreeze_frontend()
+
+    # -------------------------------------------------------------------------
+    # WRCD-V2 / TCCTCN-V2：训练 batch 与 loss 计算
+    # -------------------------------------------------------------------------
+    def _unpack_train_batch(self, data):
+        """解析训练 batch。
+
+        基础 batch:
+            mixture, source, embd, ilens
+
+        WRCD-V2 teacher KD:
+            + teacher
+
+        WRCD-V2 consistency:
+            + embd_cons
+        """
+        if len(data) == 6:
+            mixture, source, embd, ilens, teacher, embd_cons = data
+        elif len(data) == 5:
+            mixture, source, embd, ilens, teacher = data
+            embd_cons = None
+        else:
+            mixture, source, embd, ilens = data
+            teacher = None
+            embd_cons = None
+        return mixture, source, embd, ilens, teacher, embd_cons
+
+    def _move_train_batch_to_cuda(self, mixture, source, embd, ilens, teacher, embd_cons):
+        mixture = mixture.cuda()
+        source = source.cuda()
+        embd = embd.cuda()
+        ilens = ilens.cuda()
+        if teacher is not None:
+            teacher = teacher.cuda()
+        if embd_cons is not None:
+            embd_cons = embd_cons.cuda()
+        return mixture, source, embd, ilens, teacher, embd_cons
+
+    def _compute_train_loss(self, mixture, source, embd, teacher, embd_cons):
+        """计算训练 loss，并显式分隔各实验项。"""
+        estimate_source = self.model(mixture, embd)
+
+        # ===== WRCD-V2：第二个 wake aux 的一致性前向 =====
+        estimate_source_cons = None
+        if embd_cons is not None and self.lambda_cons > 0:
+            estimate_source_cons = self.model(mixture, embd_cons)
+
+        min_len = min(estimate_source.shape[1], source.shape[1])
+        if teacher is not None:
+            min_len = min(min_len, teacher.shape[1])
+        if estimate_source_cons is not None:
+            min_len = min(min_len, estimate_source_cons.shape[1])
+
+        estimate_source = estimate_source[:, :min_len]
+        source = source[:, :min_len]
+
+        # ===== 基础监督项：所有实验共享 =====
+        loss_sup = batchMean_sisnrLoss(estimate_source, source)
+        loss = loss_sup
+        metrics = {
+            'sup': loss_sup,
+            'kd': None,
+            'cons': None,
+            'anti': None,
+        }
+
+        # ===== WRCD-V2：teacher waveform KD =====
+        if teacher is not None and self.lambda_kd > 0:
+            teacher = teacher[:, :min_len]
+            metrics['kd'] = batchMean_sisnrLoss(estimate_source, teacher)
+            loss = loss + self.lambda_kd * metrics['kd']
+
+        # ===== WRCD-V2：双 wake aux 输出一致性 =====
+        if estimate_source_cons is not None and self.lambda_cons > 0:
+            estimate_source_cons = estimate_source_cons[:, :min_len]
+            metrics['cons'] = torch.mean(
+                torch.abs(estimate_source - estimate_source_cons.detach())
+            )
+            loss = loss + self.lambda_cons * metrics['cons']
+
+        # ===== TCCTCN-V2：anti-interferer SI-SNR，降低 target-swap 风险 =====
+        if self.lambda_anti > 0:
+            interferer = mixture[:, :min_len] - source
+            anti_score = sisnr(estimate_source, interferer)
+            metrics['anti'] = torch.relu(anti_score - self.anti_sisnr_margin).mean()
+            loss = loss + self.lambda_anti * metrics['anti']
+
+        return loss, metrics
+
+    def _log_train_iter(self, epoch, i, total_loss, loss, metrics, start):
+        if metrics['kd'] is None and metrics['cons'] is None and metrics['anti'] is None:
+            self.logger.info(
+                'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
+                'Current Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
+                    epoch + 1,
+                    i + 1,
+                    total_loss / (i + 1),
+                    loss.item(),
+                    1000 * (time.time() - start) / (i + 1),
+                )
+            )
+            return
+
+        kd_value = metrics['kd'].item() if metrics['kd'] is not None else 0.0
+        cons_value = metrics['cons'].item() if metrics['cons'] is not None else 0.0
+        anti_value = metrics['anti'].item() if metrics['anti'] is not None else 0.0
+        self.logger.info(
+            'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
+            'Current Loss {3:3.6f} | Sup {4:3.6f} | KD {5:3.6f} | '
+            'Cons {6:3.6f} | Anti {7:3.6f} | {8:5.1f} ms/batch'.format(
+                epoch + 1,
+                i + 1,
+                total_loss / (i + 1),
+                loss.item(),
+                metrics['sup'].item(),
+                kd_value,
+                cons_value,
+                anti_value,
+                1000 * (time.time() - start) / (i + 1),
+            )
+        )
 
     def _run_train_epoch(self, epoch):
-
         start = time.time()
         total_loss = 0
-        data_loader = self.tr_loader
 
-        for i, (data) in enumerate(data_loader):
+        for i, data in enumerate(self.tr_loader):
+            batch = self._unpack_train_batch(data)
+            mixture, source, embd, ilens, teacher, embd_cons = (
+                self._move_train_batch_to_cuda(*batch)
+            )
 
-            mixture, source, embd, ilens = data
-            mixture = mixture.cuda()
-            source = source.cuda()
-            embd = embd.cuda()
-            ilens = ilens.cuda()
-            
-            estimate_source = self.model(mixture, embd)
-
-            loss = batchMean_sisnrLoss(estimate_source, source)
+            loss, metrics = self._compute_train_loss(
+                mixture, source, embd, teacher, embd_cons
+            )
 
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                            self.max_norm)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
             self.optimizer.step()
 
             total_loss += loss.item()
 
             if i % self.print_freq == 0:
-                self.logger.info('Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
-                    'Current Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
-                        epoch + 1, i + 1, total_loss / (i + 1),
-                        loss.item(), 1000 * (time.time() - start) / (i + 1)))
+                self._log_train_iter(epoch, i, total_loss, loss, metrics, start)
 
         return total_loss / (i + 1)
-    
-    def _run_valid_epoch(self, epoch):
 
+    # -------------------------------------------------------------------------
+    # Valid chunking：validation 长语音分块前向
+    # -------------------------------------------------------------------------
+    def _valid_chunk_starts(self, total_len):
+        """[Valid chunking] 给定总长度，生成覆盖整句的 chunk 起点。"""
+        if self.valid_chunk_len <= 0 or total_len <= self.valid_chunk_len:
+            return [0]
+
+        starts = list(range(0, total_len - self.valid_chunk_len + 1, self.valid_chunk_hop))
+        tail_start = total_len - self.valid_chunk_len
+        if starts[-1] != tail_start:
+            starts.append(tail_start)
+        return starts
+
+    def _estimate_valid_source(self, mixture, embd):
+        """[Valid chunking] validation 阶段按块估计，再对重叠区域平均。"""
+        total_len = mixture.shape[1]
+        if self.valid_chunk_len <= 0 or total_len <= self.valid_chunk_len:
+            return self.model(mixture, embd)
+
+        estimate = mixture.new_zeros(mixture.shape[0], total_len)
+        weight = mixture.new_zeros(mixture.shape[0], total_len)
+        for start in self._valid_chunk_starts(total_len):
+            end = min(start + self.valid_chunk_len, total_len)
+            chunk_estimate = self.model(mixture[:, start:end], embd)
+            chunk_len = min(chunk_estimate.shape[1], end - start)
+            estimate[:, start:start + chunk_len] += chunk_estimate[:, :chunk_len]
+            weight[:, start:start + chunk_len] += 1
+
+        return estimate / weight.clamp_min(1)
+
+    def _run_valid_epoch(self, epoch):
         start = time.time()
         total_loss = 0
-        data_loader = self.cv_loader
 
-        for i, (data) in enumerate(data_loader):
-
+        for i, data in enumerate(self.cv_loader):
             mixture, source, embd, ilens = data
             mixture = mixture.cuda()
             source = source.cuda()
             embd = embd.cuda()
             ilens = ilens.cuda()
-            
-            estimate_source = self.model(mixture, embd)
+
+            estimate_source = self._estimate_valid_source(mixture, embd)
             min_len = min(estimate_source.shape[1], source.shape[1])
-            loss = batchMean_sisnrLoss(estimate_source[:,:min_len], source[:,:min_len])
+            loss = batchMean_sisnrLoss(
+                estimate_source[:, :min_len],
+                source[:, :min_len],
+            )
 
             total_loss += loss.item()
 
             if i % self.print_freq == 0:
-                self.logger.info('Epoch {0:3d} | Iter {1:5d} | Average Valid Loss {2:3.3f} | '
+                self.logger.info(
+                    'Epoch {0:3d} | Iter {1:5d} | Average Valid Loss {2:3.3f} | '
                     'Current Valid Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
-                        epoch + 1, i + 1, total_loss / (i + 1),
-                        loss.item(), 1000 * (time.time() - start) / (i + 1)))
+                        epoch + 1,
+                        i + 1,
+                        total_loss / (i + 1),
+                        loss.item(),
+                        1000 * (time.time() - start) / (i + 1),
+                    )
+                )
 
         return total_loss / (i + 1)
-    
+
+    # -------------------------------------------------------------------------
+    # 通用训练主循环
+    # -------------------------------------------------------------------------
+    def _save_checkpoint(self, file_path, epoch):
+        torch.save(
+            {
+                'epoch': epoch + 1,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state': self.optimizer.state_dict(),
+                'trandom_state': torch.get_rng_state(),
+                'nrandom_state': np.random.get_state(),
+            },
+            file_path,
+        )
+
     def train(self):
-        # 前端冻结 warm-up 由 config 控制。
-
-        # Train model multi-epoches
         for epoch in range(self.start_epoch, self.epochs):
-
-            # ===== [新增 2/2]：在每一个 Epoch 开始前，根据状态机判断是否需要解冻 =====
-            if (
-                self.freeze_frontend_warmup
-                and self.frontend_warmup_epochs > 0
-                and epoch < self.frontend_warmup_epochs
-            ):
-                self._freeze_frontend()
-            elif (
-                self.freeze_frontend_warmup
-                and self.frontend_warmup_epochs > 0
-                and epoch == self.frontend_warmup_epochs
-            ):
-                self._unfreeze_frontend()
-                # 首次解冻时，将学习率衰减，防止破坏前端的预训练权重
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] *= self.frontend_unfreeze_lr_scale
-                self.logger.info(
-                    "-> [学习率调整] 解冻前端，整体学习率已乘以 %.4g。"
-                    % self.frontend_unfreeze_lr_scale
-                )
-            elif (
-                self.freeze_frontend_warmup
-                and self.frontend_warmup_epochs > 0
-                and epoch > self.frontend_warmup_epochs
-            ):
-                self._unfreeze_frontend() # 确保断点恢复后依然是解冻状态
-            # ===================================================================
-
-            else:
-                self._unfreeze_frontend()
+            self._apply_frontend_schedule(epoch)
 
             optim_state = self.optimizer.state_dict()
-            self.logger.info('epoch start Learning rate: {lr:.6f}'.format(lr=optim_state['param_groups'][0]['lr']))
+            self.logger.info(
+                'epoch start Learning rate: {lr:.6f}'.format(
+                    lr=optim_state['param_groups'][0]['lr']
+                )
+            )
             self.logger.info("Training...")
-            
-            # train stage
+
+            # ===== Training stage =====
             self.model.train()
             start = time.time()
             tr_loss = self._run_train_epoch(epoch)
 
-            # train log
             self.logger.info('-' * 85)
-            self.logger.info('Train Summary | End of Epoch {0:5d} | Time {1:.2f}s | '
+            self.logger.info(
+                'Train Summary | End of Epoch {0:5d} | Time {1:.2f}s | '
                 'Train Loss {2:.3f}'.format(
-                    epoch + 1, time.time() - start, tr_loss))
+                    epoch + 1,
+                    time.time() - start,
+                    tr_loss,
+                )
+            )
             self.logger.info('-' * 85)
 
-            # Save model each epoch
             if self.checkpoint:
                 file_path = os.path.join(
-                    self.save_folder, 'epoch%d.pth.tar' % (epoch + 1))
-                torch.save({
-                    'epoch': epoch+1,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state': self.optimizer.state_dict(),
-                    'trandom_state': torch.get_rng_state(),
-                    'nrandom_state': np.random.get_state()}, file_path)
+                    self.save_folder,
+                    'epoch%d.pth.tar' % (epoch + 1),
+                )
+                self._save_checkpoint(file_path, epoch)
                 self.logger.info('Saving checkpoint model to %s' % file_path)
 
-            # validation stage
+            # ===== Validation stage：这里会走 Valid chunking =====
             self.logger.info('Cross validation...')
-            
             self.model.eval()
             with torch.no_grad():
                 val_loss = self._run_valid_epoch(epoch)
-                
-            # val log
+
             self.logger.info('-' * 85)
-            self.logger.info('Valid Summary | End of Epoch {0} | Time {1:.2f}s | '
+            self.logger.info(
+                'Valid Summary | End of Epoch {0} | Time {1:.2f}s | '
                 'Valid Loss {2:.3f}'.format(
-                    epoch + 1, time.time() - start, val_loss))
+                    epoch + 1,
+                    time.time() - start,
+                    val_loss,
+                )
+            )
             self.logger.info('-' * 85)
 
-            # save the temp_best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                best_file_path = os.path.join(
-                    self.save_folder, 'temp_best.pth.tar')
-                torch.save({
-                    'epoch': epoch+1,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state': self.optimizer.state_dict(),
-                    'trandom_state': torch.get_rng_state(),
-                    'nrandom_state': np.random.get_state()}, best_file_path)
-                self.logger.info("Find better validated model, saving to %s" % best_file_path)
-            
+                best_file_path = os.path.join(self.save_folder, 'temp_best.pth.tar')
+                self._save_checkpoint(best_file_path, epoch)
+                self.logger.info(
+                    "Find better validated model, saving to %s" % best_file_path
+                )
+
             self.scheduler.step(val_loss)

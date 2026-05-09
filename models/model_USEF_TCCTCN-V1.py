@@ -145,17 +145,7 @@ class TargetConditionedCausalTCNBlock(nn.Module):
     throughout the temporal backend instead of injecting it only once before all TCN layers.
     """
 
-    def __init__(
-        self,
-        in_channels,
-        conv_channels,
-        kernel_size,
-        dilation,
-        dropout=0.0,
-        cond_scale_init=1.0,
-        cond_scale_trainable=True,
-        zero_init_cond_proj=False,
-    ):
+    def __init__(self, in_channels, conv_channels, kernel_size, dilation, dropout=0.0):
         super().__init__()
         self.in_proj = nn.Conv1d(in_channels, conv_channels, 1, bias=False)
         self.prelu1 = nn.PReLU()
@@ -170,15 +160,6 @@ class TargetConditionedCausalTCNBlock(nn.Module):
 
         # gamma, beta, gate are generated from the frame-level target cue.
         self.cond_proj = nn.Conv1d(in_channels, conv_channels * 3, 1)
-        if zero_init_cond_proj:
-            nn.init.zeros_(self.cond_proj.weight)
-            nn.init.zeros_(self.cond_proj.bias)
-
-        cond_scale = torch.tensor(float(cond_scale_init))
-        if cond_scale_trainable:
-            self.cond_scale = nn.Parameter(cond_scale)
-        else:
-            self.register_buffer("cond_scale", cond_scale)
 
         self.prelu2 = nn.PReLU()
         self.norm2 = FramewiseLayerNorm(conv_channels)
@@ -203,9 +184,8 @@ class TargetConditionedCausalTCNBlock(nn.Module):
         gamma = torch.tanh(gamma)
         gate = torch.sigmoid(gate)
 
-        # Residual target modulation. Keep this path scaled so an unreliable
-        # target cue cannot dominate the temporal backend early in training.
-        out = out + torch.tanh(self.cond_scale) * gate * (gamma * out + beta)
+        # Residual target modulation. The gate lets the block ignore unreliable target cues.
+        out = out + gate * (gamma * out + beta)
 
         out = self.prelu2(out)
         out = self.norm2(out)
@@ -224,9 +204,6 @@ class TargetConditionedCausalTCNBackend(nn.Module):
         num_blocks=8,
         num_repeats=3,
         dropout=0.0,
-        cond_scale_init=1.0,
-        cond_scale_trainable=True,
-        zero_init_cond_proj=False,
     ):
         super().__init__()
         blocks = []
@@ -240,9 +217,6 @@ class TargetConditionedCausalTCNBackend(nn.Module):
                         kernel_size=kernel_size,
                         dilation=dilation,
                         dropout=dropout,
-                        cond_scale_init=cond_scale_init,
-                        cond_scale_trainable=cond_scale_trainable,
-                        zero_init_cond_proj=zero_init_cond_proj,
                     )
                 )
         self.blocks = nn.ModuleList(blocks)
@@ -269,9 +243,6 @@ class Tar_Model(nn.Module):
         num_repeats=3,
         dropout=0.0,
         use_gated_residual_film=True,
-        cond_scale_init=1.0,
-        cond_scale_trainable=True,
-        zero_init_cond_proj=False,
         **kwargs,
     ):
         super().__init__()
@@ -297,9 +268,6 @@ class Tar_Model(nn.Module):
             num_blocks=num_blocks,
             num_repeats=num_repeats,
             dropout=dropout,
-            cond_scale_init=cond_scale_init,
-            cond_scale_trainable=cond_scale_trainable,
-            zero_init_cond_proj=zero_init_cond_proj,
         )
 
         self.prelu = nn.PReLU()
