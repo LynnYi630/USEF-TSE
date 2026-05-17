@@ -1,8 +1,6 @@
 # USEF-TSE: Universal Speaker Embedding Free Target Speaker Extraction
 
-[![Paper](https://img.shields.io/badge/Paper-red?&logo=arxiv)](https://arxiv.org/pdf/2409.02615)
-
-Official Implementation of USEF-TSE: Universal Speaker Embedding Free Target Speaker Extraction.
+Forked Implementation of USEF-TSE: Universal Speaker Embedding Free Target Speaker Extraction.
 
 To refer to the model class, check [models](./models/) directly.
 
@@ -23,7 +21,7 @@ Please note that before performing model inference, you need to check the data p
 
 ## Model Checkpoint
 
-Our USEF-TSE checkpoints can be downloaded [here](https://huggingface.co/ZBang/USEF-TSE).
+Author's USEF-TSE checkpoints can be downloaded [here](https://huggingface.co/ZBang/USEF-TSE).
 
 ## LICENSE
 
