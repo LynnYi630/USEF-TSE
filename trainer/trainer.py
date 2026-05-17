@@ -2,6 +2,7 @@
 
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -40,6 +41,13 @@ class Trainer(object):
 
         self.best_val_loss = float("inf")
         self.start_epoch = 0
+
+        # ===== Mixed precision: keeps model forward fast while losses stay fp32 =====
+        self.use_amp = bool(config.get('use_amp', False))
+        self.amp_dtype = self._parse_amp_dtype(config.get('amp_dtype', 'float16'))
+        self.grad_scaler = self._make_grad_scaler(
+            self.use_amp and self.amp_dtype == torch.float16
+        )
 
         # ===== Valid chunking：只影响 validation，不影响训练和 eval.py =====
         # 目的：CV 阶段数据集可以返回全长语音，但模型按 chunk 前向，降低 attention 显存峰值。
@@ -95,6 +103,12 @@ class Trainer(object):
         if self.continue_from:
             self._load_checkpoint()
 
+        if self.use_amp:
+            self.logger.info(
+                'AMP enabled for model forward (dtype=%s). Losses are computed in fp32.'
+                % str(self.amp_dtype).replace('torch.', '')
+            )
+
     # -------------------------------------------------------------------------
     # 配置校验与 checkpoint 加载
     # -------------------------------------------------------------------------
@@ -122,6 +136,33 @@ class Trainer(object):
             raise ValueError('lambda_anti must be >= 0')
         if self.frontend_warmup_epochs < 0:
             raise ValueError('frontend_warmup_epochs must be >= 0')
+
+    def _parse_amp_dtype(self, amp_dtype):
+        amp_dtype = str(amp_dtype).lower()
+        if amp_dtype in ('bf16', 'bfloat16'):
+            return torch.bfloat16
+        if amp_dtype in ('fp16', 'float16', 'half'):
+            return torch.float16
+        raise ValueError('amp_dtype must be "float16" or "bfloat16"')
+
+    def _make_grad_scaler(self, enabled):
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+            try:
+                return torch.amp.GradScaler('cuda', enabled=enabled)
+            except TypeError:
+                return torch.amp.GradScaler(enabled=enabled)
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+    def _autocast(self):
+        if not self.use_amp:
+            return nullcontext()
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+            return torch.amp.autocast(
+                device_type='cuda',
+                dtype=self.amp_dtype,
+                enabled=True,
+            )
+        return torch.cuda.amp.autocast(dtype=self.amp_dtype, enabled=True)
 
     def _load_checkpoint(self):
         """通用 checkpoint 恢复；其中包含 TCCTCN-V2 的 conditioning reset。"""
@@ -152,6 +193,11 @@ class Trainer(object):
             torch.set_rng_state(cont['trandom_state'])
         if 'nrandom_state' in cont and cont['nrandom_state'] is not None:
             np.random.set_state(cont['nrandom_state'])
+        if (
+            self.grad_scaler.is_enabled()
+            and cont.get('amp_scaler_state') is not None
+        ):
+            self.grad_scaler.load_state_dict(cont['amp_scaler_state'])
 
     # -------------------------------------------------------------------------
     # TCCTCN-V2：target-conditioned path 初始化/重置
@@ -165,10 +211,11 @@ class Trainer(object):
             return
 
         for block in blocks:
-            cond_proj = getattr(block, 'cond_proj', None)
-            if cond_proj is not None and self.tc_zero_init_cond_proj:
-                nn.init.zeros_(cond_proj.weight)
-                nn.init.zeros_(cond_proj.bias)
+            if self.tc_zero_init_cond_proj:
+                for name, module in block.named_modules():
+                    if name.endswith('cond_proj') and isinstance(module, nn.Conv1d):
+                        nn.init.zeros_(module.weight)
+                        nn.init.zeros_(module.bias)
 
             cond_scale = getattr(block, 'cond_scale', None)
             if cond_scale is not None:
@@ -293,12 +340,13 @@ class Trainer(object):
 
     def _compute_train_loss(self, mixture, source, embd, teacher, embd_cons):
         """计算训练 loss，并显式分隔各实验项。"""
-        estimate_source = self.model(mixture, embd)
+        with self._autocast():
+            estimate_source = self.model(mixture, embd)
 
-        # ===== WRCD-V2：第二个 wake aux 的一致性前向 =====
-        estimate_source_cons = None
-        if embd_cons is not None and self.lambda_cons > 0:
-            estimate_source_cons = self.model(mixture, embd_cons)
+            # ===== WRCD-V2：第二个 wake aux 的一致性前向 =====
+            estimate_source_cons = None
+            if embd_cons is not None and self.lambda_cons > 0:
+                estimate_source_cons = self.model(mixture, embd_cons)
 
         min_len = min(estimate_source.shape[1], source.shape[1])
         if teacher is not None:
@@ -308,9 +356,11 @@ class Trainer(object):
 
         estimate_source = estimate_source[:, :min_len]
         source = source[:, :min_len]
+        estimate_source_loss = estimate_source.float()
+        source_loss = source.float()
 
         # ===== 基础监督项：所有实验共享 =====
-        loss_sup = batchMean_sisnrLoss(estimate_source, source)
+        loss_sup = batchMean_sisnrLoss(estimate_source_loss, source_loss)
         loss = loss_sup
         metrics = {
             'sup': loss_sup,
@@ -321,35 +371,35 @@ class Trainer(object):
 
         # ===== WRCD-V2：teacher waveform KD =====
         if teacher is not None and self.lambda_kd > 0:
-            teacher = teacher[:, :min_len]
-            metrics['kd'] = batchMean_sisnrLoss(estimate_source, teacher)
+            teacher = teacher[:, :min_len].float()
+            metrics['kd'] = batchMean_sisnrLoss(estimate_source_loss, teacher)
             loss = loss + self.lambda_kd * metrics['kd']
 
         # ===== WRCD-V2：双 wake aux 输出一致性 =====
         if estimate_source_cons is not None and self.lambda_cons > 0:
-            estimate_source_cons = estimate_source_cons[:, :min_len]
+            estimate_source_cons = estimate_source_cons[:, :min_len].float()
             metrics['cons'] = torch.mean(
-                torch.abs(estimate_source - estimate_source_cons.detach())
+                torch.abs(estimate_source_loss - estimate_source_cons.detach())
             )
             loss = loss + self.lambda_cons * metrics['cons']
 
         # ===== TCCTCN-V2：anti-interferer SI-SNR，降低 target-swap 风险 =====
         if self.lambda_anti > 0:
-            interferer = mixture[:, :min_len] - source
-            anti_score = sisnr(estimate_source, interferer)
+            interferer = mixture[:, :min_len].float() - source_loss
+            anti_score = sisnr(estimate_source_loss, interferer)
             metrics['anti'] = torch.relu(anti_score - self.anti_sisnr_margin).mean()
             loss = loss + self.lambda_anti * metrics['anti']
 
         return loss, metrics
 
-    def _log_train_iter(self, epoch, i, total_loss, loss, metrics, start):
+    def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start):
         if metrics['kd'] is None and metrics['cons'] is None and metrics['anti'] is None:
             self.logger.info(
                 'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
                 'Current Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
                     epoch + 1,
                     i + 1,
-                    total_loss / (i + 1),
+                    average_loss,
                     loss.item(),
                     1000 * (time.time() - start) / (i + 1),
                 )
@@ -365,7 +415,7 @@ class Trainer(object):
             'Cons {6:3.6f} | Anti {7:3.6f} | {8:5.1f} ms/batch'.format(
                 epoch + 1,
                 i + 1,
-                total_loss / (i + 1),
+                average_loss,
                 loss.item(),
                 metrics['sup'].item(),
                 kd_value,
@@ -378,6 +428,7 @@ class Trainer(object):
     def _run_train_epoch(self, epoch):
         start = time.time()
         total_loss = 0
+        num_finite_loss = 0
 
         for i, data in enumerate(self.tr_loader):
             batch = self._unpack_train_batch(data)
@@ -389,17 +440,40 @@ class Trainer(object):
                 mixture, source, embd, teacher, embd_cons
             )
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
-            self.optimizer.step()
+            if not torch.isfinite(loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.logger.warning(
+                    'Skipping non-finite train loss at epoch %d iter %d: %s'
+                    % (epoch + 1, i + 1, str(loss.item()))
+                )
+                continue
+
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.scale(loss).backward()
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                self.optimizer.step()
 
             total_loss += loss.item()
+            num_finite_loss += 1
 
             if i % self.print_freq == 0:
-                self._log_train_iter(epoch, i, total_loss, loss, metrics, start)
+                self._log_train_iter(
+                    epoch,
+                    i,
+                    total_loss / max(num_finite_loss, 1),
+                    loss,
+                    metrics,
+                    start,
+                )
 
-        return total_loss / (i + 1)
+        return total_loss / max(num_finite_loss, 1)
 
     # -------------------------------------------------------------------------
     # Valid chunking：validation 长语音分块前向
@@ -443,11 +517,12 @@ class Trainer(object):
             embd = embd.cuda()
             ilens = ilens.cuda()
 
-            estimate_source = self._estimate_valid_source(mixture, embd)
+            with self._autocast():
+                estimate_source = self._estimate_valid_source(mixture, embd)
             min_len = min(estimate_source.shape[1], source.shape[1])
             loss = batchMean_sisnrLoss(
-                estimate_source[:, :min_len],
-                source[:, :min_len],
+                estimate_source[:, :min_len].float(),
+                source[:, :min_len].float(),
             )
 
             total_loss += loss.item()
@@ -475,6 +550,11 @@ class Trainer(object):
                 'epoch': epoch + 1,
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state': self.optimizer.state_dict(),
+                'amp_scaler_state': (
+                    self.grad_scaler.state_dict()
+                    if self.grad_scaler.is_enabled()
+                    else None
+                ),
                 'trandom_state': torch.get_rng_state(),
                 'nrandom_state': np.random.get_state(),
             },

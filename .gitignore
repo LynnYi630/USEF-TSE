@@ -8,3 +8,6 @@ __pycache__/
 *$py.class
 # vscode config
 .vscode/
+eval_progress.log
+eval_results.csv
+eval_summary.csv

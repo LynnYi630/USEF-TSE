@@ -2,17 +2,17 @@
 
 export CUDA_VISIBLE_DEVICES=0
 
-# /home/wangyi/miniconda3/envs/usef/bin/python eval.py \
-#     --config chkpt/USEF-TCN/libri2mix/config.yaml \
-#     --chkpt-path chkpt/USEF-TCN/libri2mix/temp_best.pth.tar \
-#     --device 0 \
-#     --memory 0
-
 python eval.py \
-    --config chkpt/USEF-SepFormer/wsj0-2mix/config.yaml \
-    --chkpt-path chkpt/USEF-SepFormer/wsj0-2mix/temp_best.pth.tar \
+    --config chkpt/USEF-TCN-V2/wsj0-2mix/config.yaml \
+    --chkpt-path chkpt/USEF-TCN-V2/wsj0-2mix/temp_best.pth.tar \
     --device 0 \
     --memory 0
+
+# python eval.py \
+#     --config chkpt/USEF-SepFormer/wsj0-2mix/config.yaml \
+#     --chkpt-path chkpt/USEF-SepFormer/wsj0-2mix/temp_best.pth.tar \
+#     --device 0 \
+#     --memory 0
 
 # /home/wangyi/miniconda3/envs/usef/bin/python eval.py \
 #     --config chkpt/USEF-Mamba/libri2mix/config.yaml \

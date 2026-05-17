@@ -6,13 +6,13 @@ checkpoint: 1
 continue_from: 'chkpt/init_frontend_from_sepformer_wsj0-2mix_for_tcctcn.pth.tar'
 max_norm: 5
 use_amp: True
-amp_dtype: float16
+amp_dtype: bfloat16
 print_freq: 100
-name: USEF-TCCTCN-V2/wsj0-2mix # Safe-Cond
+name: USEF-TCCTCN-V3/wsj0-2mix
 
 # frontend freezing control
-freeze_frontend_warmup: False
-frontend_warmup_epochs: 10
+freeze_frontend_warmup: True
+frontend_warmup_epochs: 3
 frontend_unfreeze_lr_scale: 0.1
 
 epochs: 200
@@ -30,8 +30,6 @@ valid_chunk_duration: 4
 valid_chunk_hop_duration: 4
 valid_wake_aux_duration: 3
 
-# Replace these three paths with your own Libri2Mix / WSJ0-2mix list directories.
-# Each directory should contain mix.scp, ref.scp, and aux.scp.
 dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
 train_path: data/train/wsj0-2mix
 valid_path: data/dev/wsj0-2mix
@@ -48,18 +46,25 @@ encoder_kernel_size: 16
 encoder_kernel_stride: 8
 embd: 256
 
-# Target-Conditioned Causal TCN backend parameters
+# Target-Conditioned TCN-V3 backend parameters
 tc_conv_channels: 512
+tc_skip_channels: 256
 tc_kernel_size: 3
 tc_num_blocks: 8
 tc_num_repeats: 3
+tc_norm: fln
+tc_causal: True
 tc_dropout: 0.0
+mask_activation: sigmoid
 use_gated_residual_film: True
 
-# Target-Conditioned Causal TCN V2 backend parameters
+# Target conditioning controls.
 tc_cond_scale_init: 0.1
 tc_cond_scale_trainable: True
 tc_zero_init_cond_proj: True
+tc_condition_depthwise: True
+tc_condition_residual: True
+tc_condition_skip: True
 reset_tc_conditioning_on_continue: True
 
 # Penalize estimates that become too similar to the non-target residual
@@ -67,12 +72,11 @@ reset_tc_conditioning_on_continue: True
 lambda_anti: 0.05
 anti_sisnr_margin: 0.0
 
-# Specifying the network
-Encoder: !new:models.model_USEF_TCCTCN.Encoder
+Encoder: !new:models.model_USEF_TCCTCN_V3.Encoder
   kernel_size: !ref <encoder_kernel_size>
   out_channels: !ref <N_encoder_out>
 
-Decoder: !new:models.model_USEF_TCCTCN.Decoder
+Decoder: !new:models.model_USEF_TCCTCN_V3.Decoder
   in_channels: !ref <N_encoder_out>
   out_channels: 1
   kernel_size: !ref <encoder_kernel_size>
@@ -85,12 +89,11 @@ Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
   nhead: 8
   d_ffn: 1024
   dropout: 0
-  # normalize_before: True
 
-FiLM: !new:models.model_USEF_TCCTCN.FiLM
+FiLM: !new:models.model_USEF_TCCTCN_V3.FiLM
   size: !ref <out_channels>
 
-MaskNet: !new:models.model_USEF_TCCTCN.Tar_Model
+MaskNet: !new:models.model_USEF_TCCTCN_V3.Tar_Model
   encoder: !ref <Encoder>
   decoder: !ref <Decoder>
   fusion_mdl: !ref <Fusion_mdl>
@@ -99,14 +102,21 @@ MaskNet: !new:models.model_USEF_TCCTCN.Tar_Model
   out_channels: !ref <out_channels>
   num_spks: !ref <num_spks>
   conv_channels: !ref <tc_conv_channels>
+  skip_channels: !ref <tc_skip_channels>
   kernel_size: !ref <tc_kernel_size>
   num_blocks: !ref <tc_num_blocks>
   num_repeats: !ref <tc_num_repeats>
+  norm: !ref <tc_norm>
+  causal: !ref <tc_causal>
   dropout: !ref <tc_dropout>
+  mask_activation: !ref <mask_activation>
   use_gated_residual_film: !ref <use_gated_residual_film>
   cond_scale_init: !ref <tc_cond_scale_init>
   cond_scale_trainable: !ref <tc_cond_scale_trainable>
   zero_init_cond_proj: !ref <tc_zero_init_cond_proj>
+  condition_depthwise: !ref <tc_condition_depthwise>
+  condition_residual: !ref <tc_condition_residual>
+  condition_skip: !ref <tc_condition_skip>
 
 modules:
   masknet: !ref <MaskNet>

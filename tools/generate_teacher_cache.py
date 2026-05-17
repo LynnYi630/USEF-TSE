@@ -21,7 +21,7 @@ This script:
 Use the generated output directory as teacher_cache_dir in WRCD configs.
 
 To generate teacher caches:
-    python3 generate_teacher_cache.py \
+    python3 tools/generate_teacher_cache.py \
       --config config/config-USEF-SepFormer.yaml \
       --chkpt-path chkpt/USEF-SepFormer/libri2mix/best.pth.tar \
       --data-path data/train/libri2mix \
@@ -39,6 +39,7 @@ Notes:
 
 import argparse
 import os
+import sys
 from collections import OrderedDict
 from pathlib import Path
 
@@ -46,6 +47,10 @@ import librosa
 import torch
 from hyperpyyaml import load_hyperpyyaml
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from dataset.data import teacher_cache_path
 

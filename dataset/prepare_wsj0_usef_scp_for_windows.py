@@ -19,6 +19,11 @@ This script has three subcommands:
    Use this for your own training or ablation experiments, not for exact
    reproduction of the author's released checkpoint.
 
+   By default, aux/enrollment candidates are restricted to the standard
+   WSJ0-2mix source partitions:
+     - tr/cv: si_tr_s
+     - tt:    si_dt_05 and si_et_05
+
 3) validate
    Checks that mix/ref/aux scp files have matching keys and reasonable
    target-speaker/aux-speaker consistency.
@@ -28,7 +33,7 @@ Recommended for reproducing the author's released checkpoint:
     python prepare_wsj0_usef_scp_for_windows.py rewrite \
         --src-dir /mnt/d/wsl/USEF-TSE-ZBang/data/test/wsj0-2mix \
         --out-dir wsj0-2mix_abs \
-        --wsj0-root /mnt/d/Datasets/wsj0 \
+        --wsj0-root /mnt/d/Datasets/wsj0_8k \
         --wsj02mix-root /mnt/d/Datasets/wsj0-2mix
 
 Add --check-exists only when you need a full file-existence audit. On WSL
@@ -39,12 +44,14 @@ Then set config test path to data/test/wsj0-2mix_abs.
 
 To generate new scp files:
 	python3 prepare_wsj0_usef_scp_for_windows.py generate \
-  		--wsj0-root /mnt/d/Datasets/wsj0 \
+  		--wsj0-root /mnt/d/Datasets/wsj0_8k \
   		--wsj02mix-root /mnt/d/Datasets/wsj0-2mix \
-  		--out-dir data/generated_scp \
+  		--out-dir wsj0-2mix_scp \
   		--splits tr cv tt \
   		--mix-mode min \
   		--aux-policy hash \
+  		--train-aux-subsets si_tr_s \
+  		--test-aux-subsets si_dt_05 si_et_05 \
   		--seed 3407 \
   		--key-style author \
   		--path-style absolute \
@@ -226,26 +233,65 @@ def is_wav_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() == ".wav"
 
 
-def build_wsj0_index(wsj0_root: Path) -> Dict[str, List[Path]]:
-    """Index WSJ0 utterances by the first 3 chars of the wav stem."""
+def build_wsj0_index(
+    wsj0_root: Path,
+    allowed_subsets: Optional[Sequence[str]] = None,
+) -> Dict[str, List[Path]]:
+    """Index WSJ0 utterances by speaker ID.
+
+    Speaker ID is inferred from the first 3 characters of the wav stem, which
+    matches the WSJ0 naming convention used by WSJ0-2mix. When
+    allowed_subsets is provided, only wavs under those top-level WSJ0
+    subdirectories are indexed. This prevents test aux/enrollment speech from
+    being drawn from unrelated WSJ0 partitions such as sd_*, *_20, *_jd, etc.
+    """
     if not wsj0_root.is_dir():
         raise NotADirectoryError(wsj0_root)
 
+    if allowed_subsets:
+        search_roots = []
+        for subset in allowed_subsets:
+            subset_root = wsj0_root / subset
+            if not subset_root.is_dir():
+                raise NotADirectoryError(
+                    f"Expected WSJ0 subset directory not found: {subset_root}"
+                )
+            search_roots.append(subset_root)
+    else:
+        search_roots = [wsj0_root]
+
     index: Dict[str, List[Path]] = {}
     n_wavs = 0
-    for wav in wsj0_root.rglob("*.wav"):
-        spk = wav.stem[:3]
-        index.setdefault(spk, []).append(wav)
-        n_wavs += 1
-        if n_wavs % 10000 == 0:
-            print(f"[INFO] indexed {n_wavs} WSJ0 wavs ...", flush=True)
+    for search_root in search_roots:
+        for wav in search_root.rglob("*.wav"):
+            spk = wav.stem[:3]
+            index.setdefault(spk, []).append(wav)
+            n_wavs += 1
+            if n_wavs % 10000 == 0:
+                print(f"[INFO] indexed {n_wavs} WSJ0 wavs ...", flush=True)
 
     for spk in index:
         index[spk].sort(key=lambda x: str(x))
 
+    subset_msg = (
+        ", ".join(allowed_subsets)
+        if allowed_subsets
+        else "all WSJ0 subsets"
+    )
     if not index:
-        raise RuntimeError(f"No wav files found under {wsj0_root}")
+        raise RuntimeError(
+            f"No wav files found under {wsj0_root} for subsets: {subset_msg}"
+        )
     return index
+
+
+def aux_subsets_for_split(split: str, args: argparse.Namespace) -> List[str]:
+    """Return the WSJ0 top-level subsets allowed for aux generation."""
+    if split in {"tr", "cv"}:
+        return list(args.train_aux_subsets)
+    if split == "tt":
+        return list(args.test_aux_subsets)
+    raise ValueError(f"Unsupported split: {split}")
 
 
 def choose_aux(
@@ -309,11 +355,35 @@ def command_generate(args: argparse.Namespace) -> None:
     wsj02mix_root = Path(args.wsj02mix_root).expanduser().resolve()
     out_root = Path(args.out_dir).expanduser().resolve()
 
-    print(f"[INFO] indexing WSJ0 wavs under {wsj0_root} ...", flush=True)
-    speaker_index = build_wsj0_index(wsj0_root)
-    print(f"[OK] indexed {sum(len(v) for v in speaker_index.values())} WSJ0 wavs from {len(speaker_index)} speakers")
+    index_cache: Dict[Tuple[str, ...], Dict[str, List[Path]]] = {}
 
     for split in args.splits:
+        allowed_subsets = aux_subsets_for_split(split, args)
+        cache_key = tuple(allowed_subsets)
+        if cache_key not in index_cache:
+            print(
+                "[INFO] indexing WSJ0 wavs under {root} for aux subsets: {subsets} ...".format(
+                    root=wsj0_root,
+                    subsets=",".join(allowed_subsets),
+                ),
+                flush=True,
+            )
+            index_cache[cache_key] = build_wsj0_index(
+                wsj0_root,
+                allowed_subsets=allowed_subsets,
+            )
+            indexed = index_cache[cache_key]
+            print(
+                "[OK] indexed {num_wavs} WSJ0 wavs from {num_spks} speakers "
+                "for aux subsets: {subsets}".format(
+                    num_wavs=sum(len(v) for v in indexed.values()),
+                    num_spks=len(indexed),
+                    subsets=",".join(allowed_subsets),
+                )
+            )
+
+        speaker_index = index_cache[cache_key]
+
         split_dir = wsj02mix_root / "2speakers" / args.sample_rate_dir / args.mix_mode / split
         mix_dir = split_dir / "mix"
         s1_dir = split_dir / "s1"
@@ -541,6 +611,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mix-mode", default="min", choices=["min", "max"])
     p.add_argument("--sample-rate-dir", default="wav8k", choices=["wav8k"])
     p.add_argument("--aux-policy", default="hash", choices=["hash", "first", "random"])
+    p.add_argument("--train-aux-subsets", nargs="+", default=["si_tr_s"],
+                   help="WSJ0 top-level subset(s) allowed for tr/cv aux candidates")
+    p.add_argument("--test-aux-subsets", nargs="+", default=["si_dt_05", "si_et_05"],
+                   help="WSJ0 top-level subset(s) allowed for tt aux candidates")
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--key-style", default="author", choices=["author", "index"], help="author => base_auxStem; index => base_1/base_2")
     p.add_argument("--path-style", default="absolute", choices=["absolute", "author", "relative"])

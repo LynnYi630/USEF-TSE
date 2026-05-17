@@ -64,12 +64,11 @@ class tr_dataset(Dataset):
         )
     
     def _trun_wav(self, y, tlen, offset=0):
+        y = y[offset:offset + tlen]
         if y.shape[0] < tlen:
             npad = tlen - y.shape[0]
             y = np.pad(y, (0, npad), mode='constant', constant_values=0)
-        else:
-            y = y[offset:offset+tlen]
-        return y 
+        return y
 
     def _load_teacher_est(self, utt):
         path = teacher_cache_path(self.teacher_cache_dir, utt)
@@ -218,12 +217,11 @@ class te_dataset(Dataset):
         self.aux_len = int(aux_duration * fs) if aux_duration else None
 
     def _trun_wav(self, y, tlen, offset=0):
+        y = y[offset:offset + tlen]
         if y.shape[0] < tlen:
             npad = tlen - y.shape[0]
             y = np.pad(y, (0, npad), mode='constant', constant_values=0)
-        else:
-            y = y[offset:offset+tlen]
-        return y 
+        return y
     
     def __getitem__(self, sample_idx):
         if isinstance(sample_idx, int):

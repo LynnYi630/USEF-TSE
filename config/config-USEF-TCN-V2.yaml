@@ -1,0 +1,100 @@
+optimizer: !name:torch.optim.Adam
+  lr: 0.0001
+  weight_decay: 0
+
+checkpoint: 1
+continue_from: 'chkpt/init_frontend_from_sepformer_wsj0-2mix_for_tcn_v2.pth.tar'
+max_norm: 5
+use_amp: True
+amp_dtype: bfloat16
+print_freq: 100
+name: USEF-TCN-V2/wsj0-2mix
+
+# frontend freezing control
+freeze_frontend_warmup: False
+frontend_warmup_epochs: 3
+frontend_unfreeze_lr_scale: 0.1
+
+epochs: 150
+batch_size: 4
+num_workers: 8
+valid_batch_size: 1
+
+num_spks: 1
+duration: 4
+sample_rate: 8000
+# Validation-only controls:
+# valid_chunk_* makes trainer validation run long mixtures in chunks to reduce GPU memory.
+# valid_wake_aux_duration caps the enrollment/aux audio length passed by te_dataset.
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
+
+dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
+train_path: data/train/wsj0-2mix
+valid_path: data/dev/wsj0-2mix
+test_path: data/test/wsj0-2mix
+
+mix_scp: mix.scp
+ref_scp: ref.scp
+aux_scp: aux.scp
+
+# Encoder parameters
+N_encoder_out: 256
+out_channels: 256
+kernel_size: 16
+kernel_stride: 8
+embd: 256
+
+# TCN-V2 backend parameters
+tcn_conv_channels: 512
+tcn_skip_channels: 256
+tcn_kernel_size: 3
+tcn_num_blocks: 8
+tcn_num_repeats: 3
+tcn_norm: gln          # fln is frame-wise LN; gln/gn/bn are also supported.
+tcn_causal: False      # True uses left padding in depthwise convolutions.
+tcn_dropout: 0.0
+mask_activation: relu # relu/softplus/none
+
+# Specifying the network
+Encoder: !new:models.model_USEF_TCN_V2.Encoder
+  kernel_size: !ref <kernel_size>
+  out_channels: !ref <N_encoder_out>
+
+Decoder: !new:models.model_USEF_TCN_V2.Decoder
+  in_channels: !ref <N_encoder_out>
+  out_channels: 1
+  kernel_size: !ref <kernel_size>
+  stride: !ref <kernel_stride>
+  bias: False
+
+Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
+  num_layers: 4
+  d_model: !ref <out_channels>
+  nhead: 8
+  d_ffn: 1024
+  dropout: 0
+
+FiLM: !new:models.model_USEF_TCN_V2.FiLM
+  size: !ref <out_channels>
+
+MaskNet: !new:models.model_USEF_TCN_V2.Tar_Model
+  encoder: !ref <Encoder>
+  decoder: !ref <Decoder>
+  fusion_mdl: !ref <Fusion_mdl>
+  film: !ref <FiLM>
+  in_channels: !ref <N_encoder_out>
+  out_channels: !ref <out_channels>
+  num_spks: !ref <num_spks>
+  tcn_conv_channels: !ref <tcn_conv_channels>
+  tcn_skip_channels: !ref <tcn_skip_channels>
+  tcn_kernel_size: !ref <tcn_kernel_size>
+  tcn_num_blocks: !ref <tcn_num_blocks>
+  tcn_num_repeats: !ref <tcn_num_repeats>
+  tcn_norm: !ref <tcn_norm>
+  tcn_causal: !ref <tcn_causal>
+  tcn_dropout: !ref <tcn_dropout>
+  mask_activation: !ref <mask_activation>
+
+modules:
+  masknet: !ref <MaskNet>

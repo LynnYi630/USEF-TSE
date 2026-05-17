@@ -160,9 +160,10 @@ def main(config, args):
     model = config['modules']['masknet']
     
     model.cuda()
-    
-    logger.info(model)
-    logger.info('-' * 50)
+
+    if args.log_model_summary:
+        logger.info(model)
+        logger.info('-' * 50)
 
     model = torch.nn.DataParallel(model)
 
@@ -198,6 +199,8 @@ if __name__ == '__main__':
                         help='override dataset paths with data/{train,dev,test}/<dataset>')
     parser.add_argument('--data-root', default='data', type=str,
                         help='root directory containing train/dev/test dataset folders')
+    parser.add_argument('--log-model-summary', action='store_true',
+                        help='print the full model structure at training start')
 
     args = parser.parse_args()
 
