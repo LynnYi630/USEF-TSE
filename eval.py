@@ -190,6 +190,9 @@ def infer_dataset_name(config, args, test_path):
 
 
 def infer_output_dir(config, args, test_path):
+    if getattr(args, "output_dir", ""):
+        return args.output_dir
+
     model_name = infer_model_name(config, args.config)
     dataset_name = infer_dataset_name(config, args, test_path)
     return os.path.join("eval_logs", model_name, dataset_name)
@@ -768,6 +771,13 @@ if __name__ == "__main__":
         type=int,
         default=3,
         help="number of warmup forward passes before timing the first utterance"
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="",
+        help="optional explicit output directory"
     )
 
     args = parser.parse_args()

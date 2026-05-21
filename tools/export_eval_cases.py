@@ -1,3 +1,27 @@
+#!/usr/bin/env python3
+r"""Export low-scoring eval cases as wav files for listening checks.
+
+The script parses the text eval log lines that contain ``uttXXXX SI-SNRi`` and
+copies each selected case's mixture, reference, and auxiliary wav files into a
+debug directory. If a checkpoint is provided, it also exports the model estimate.
+
+Usage examples:
+    python tools/export_eval_cases.py \
+      --config config/config-USEF-TCN-V2.yaml \
+      --log-file logs/USEF-TCN-V2/wsj0-2mix/eval.log \
+      --out-dir debug_eval_cases/tcn_v2_worst \
+      --top-k 10
+
+    python tools/export_eval_cases.py \
+      --config config/config-USEF-TCN-V2.yaml \
+      --log-file logs/USEF-TCN-V2/wsj0-2mix/eval.log \
+      --utt-index 1 \
+      --utt-index 42 \
+      --chkpt-path chkpt/USEF-TCN-V2/wsj0-2mix/temp_best.pth.tar \
+      --device cuda:0 \
+      --aux-duration 4
+"""
+
 import argparse
 import csv
 import os

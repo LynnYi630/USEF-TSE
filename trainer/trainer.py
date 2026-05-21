@@ -17,7 +17,8 @@ class Trainer(object):
     这个 Trainer 目前承载了几条相互独立的实验改进：
     1. WRCD-V2：短 wake aux/enrollment、teacher waveform KD、双 aux 一致性约束。
     2. TCCTCN-V2：target-conditioned TCN 的 conditioning reset，以及 anti-interferer SI-SNR loss。
-    3. Valid chunking：validation 阶段按块跑长语音，避免 SepFormer/Cross-Attention OOM。
+    3. TCCTCN-V4：把旧 checkpoint 作为初始化重新训练，以及 target-interferer margin loss。
+    4. Valid chunking：validation 阶段按块跑长语音，避免 SepFormer/Cross-Attention OOM。
 
     """
 
@@ -41,6 +42,16 @@ class Trainer(object):
 
         self.best_val_loss = float("inf")
         self.start_epoch = 0
+
+        # ===== 通用迁移初始化：把旧 checkpoint 当作初始化，而不是断点续训 =====
+        # reset_epoch_on_continue=True 时，continue_from 只加载模型权重；
+        # epoch、optimizer、随机数状态都会重新开始，适合 V4 从 TCN/WRCD 稳定主干微调。
+        self.reset_epoch_on_continue = bool(
+            config.get('reset_epoch_on_continue', False)
+        )
+        self.load_optimizer_state = bool(
+            config.get('load_optimizer_state', not self.reset_epoch_on_continue)
+        )
 
         # ===== Mixed precision: keeps model forward fast while losses stay fp32 =====
         self.use_amp = bool(config.get('use_amp', False))
@@ -72,6 +83,9 @@ class Trainer(object):
         self.frontend_unfreeze_lr_scale = float(
             config.get('frontend_unfreeze_lr_scale', 0.1)
         )
+        self.separate_frontend_backend_lr = bool(
+            config.get('separate_frontend_backend_lr', False)
+        )
 
         # ===== WRCD-V2：teacher KD + wake aux consistency =====
         # use_wrcd: 训练 batch 会额外带 teacher waveform。
@@ -81,11 +95,15 @@ class Trainer(object):
         self.lambda_kd = float(config.get('lambda_kd', 0.0))
         self.lambda_cons = float(config.get('lambda_cons', 0.0))
 
-        # ===== TCCTCN-V2：target-conditioned TCN 专用逻辑 =====
+        # ===== TCCTCN-V2/V4：target-confusion 相关训练项 =====
         # lambda_anti: 抑制模型靠近干扰说话人，缓解 target-swap。
+        # lambda_confusion: 直接约束 est-target 分数高于 est-interferer 分数。
+        # confusion_margin: 要求 target 相似度至少比 interferer 相似度高出的 margin。
         # reset_tc_conditioning_on_continue: 从旧 checkpoint 迁移时重置新加的 conditioning path。
         self.lambda_anti = float(config.get('lambda_anti', 0.0))
         self.anti_sisnr_margin = float(config.get('anti_sisnr_margin', 0.0))
+        self.lambda_confusion = float(config.get('lambda_confusion', 0.0))
+        self.confusion_margin = float(config.get('confusion_margin', 0.0))
         self.reset_tc_conditioning_on_continue = bool(
             config.get('reset_tc_conditioning_on_continue', False)
         )
@@ -134,6 +152,8 @@ class Trainer(object):
             raise ValueError('lambda_cons must be >= 0')
         if self.lambda_anti < 0:
             raise ValueError('lambda_anti must be >= 0')
+        if self.lambda_confusion < 0:
+            raise ValueError('lambda_confusion must be >= 0')
         if self.frontend_warmup_epochs < 0:
             raise ValueError('frontend_warmup_epochs must be >= 0')
 
@@ -169,9 +189,10 @@ class Trainer(object):
         print('Loading checkpoint model %s' % self.continue_from)
         # PyTorch 2.6+ 默认 weights_only=True，旧 checkpoint 需要显式关闭。
         cont = torch.load(self.continue_from, weights_only=False)
-        self.start_epoch = cont.get('epoch', 0)
+        self.start_epoch = 0 if self.reset_epoch_on_continue else cont.get('epoch', 0)
 
         # 通用迁移学习：strict=False 允许只加载形状匹配的旧权重。
+        # V4 新增 adapter 没有旧权重，会保持随机/零初始化；TCN 主干可从旧模型继承。
         self.model.load_state_dict(cont['model_state_dict'], strict=False)
 
         # ===== TCCTCN-V2：迁移旧模型时重置 target-conditioned path =====
@@ -179,7 +200,11 @@ class Trainer(object):
             self._reset_tc_conditioning()
 
         # 通用保护：如果 optimizer state 与当前模型不兼容，就跳过而不是中断训练。
-        if 'optimizer_state' in cont and cont['optimizer_state'] is not None:
+        if (
+            self.load_optimizer_state
+            and 'optimizer_state' in cont
+            and cont['optimizer_state'] is not None
+        ):
             try:
                 self.optimizer.load_state_dict(cont['optimizer_state'])
                 print("optimizer state loaded")
@@ -188,6 +213,10 @@ class Trainer(object):
                 print("optimizer_state load error: {}".format(exc))
         else:
             print("未检测到优化器状态，将随机初始化优化器（适用于迁移学习启动）。")
+
+        if self.reset_epoch_on_continue:
+            print("checkpoint 仅作为初始化使用；epoch/optimizer/RNG 状态已重置")
+            return
 
         if 'trandom_state' in cont and cont['trandom_state'] is not None:
             torch.set_rng_state(cont['trandom_state'])
@@ -235,7 +264,7 @@ class Trainer(object):
         """返回需要 warm-up 冻结的前端模块，兼容 DataParallel。"""
         model = self.model.module if hasattr(self.model, 'module') else self.model
         modules = []
-        for name in ('encoder', 'decoder', 'fusion_mdl', 'film'):
+        for name in ('encoder', 'decoder', 'conv1d1', 'fusion_mdl', 'fusion_norm', 'film'):
             module = getattr(model, name, None)
             if module is not None:
                 modules.append(module)
@@ -267,6 +296,39 @@ class Trainer(object):
         self._frontend_frozen = False
         self._frontend_unfrozen = True
 
+    def _scale_lr_after_frontend_unfreeze(self):
+        """解冻前端后的学习率调整。
+
+        默认旧逻辑：所有 param_group 都乘 frontend_unfreeze_lr_scale。
+        若启用 separate_frontend_backend_lr，则只调整 name='frontend' 的参数组，
+        backend 组保持原学习率，避免新后端/adapter 学习变慢。
+        """
+        if self.separate_frontend_backend_lr:
+            scaled = False
+            for param_group in self.optimizer.param_groups:
+                if param_group.get('name') != 'frontend':
+                    continue
+                param_group['lr'] *= self.frontend_unfreeze_lr_scale
+                scaled = True
+
+            if scaled:
+                self.logger.info(
+                    "-> [学习率调整] 解冻前端，仅 frontend 学习率乘以 %.4g，backend 学习率保持不变。"
+                    % self.frontend_unfreeze_lr_scale
+                )
+            else:
+                self.logger.info(
+                    "-> [学习率调整] 未找到 frontend 参数组，跳过单独前端学习率调整。"
+                )
+            return
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] *= self.frontend_unfreeze_lr_scale
+        self.logger.info(
+            "-> [学习率调整] 解冻前端，整体学习率已乘以 %.4g。"
+            % self.frontend_unfreeze_lr_scale
+        )
+
     def _apply_frontend_schedule(self, epoch):
         """[通用 warm-up] 每个 epoch 开始前决定是否冻结/解冻。"""
         if (
@@ -283,12 +345,7 @@ class Trainer(object):
             and epoch == self.frontend_warmup_epochs
         ):
             self._unfreeze_frontend()
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] *= self.frontend_unfreeze_lr_scale
-            self.logger.info(
-                "-> [学习率调整] 解冻前端，整体学习率已乘以 %.4g。"
-                % self.frontend_unfreeze_lr_scale
-            )
+            self._scale_lr_after_frontend_unfreeze()
             return
 
         if (
@@ -346,7 +403,8 @@ class Trainer(object):
             # ===== WRCD-V2：第二个 wake aux 的一致性前向 =====
             estimate_source_cons = None
             if embd_cons is not None and self.lambda_cons > 0:
-                estimate_source_cons = self.model(mixture, embd_cons)
+                with torch.no_grad():
+                    estimate_source_cons = self.model(mixture, embd_cons)
 
         min_len = min(estimate_source.shape[1], source.shape[1])
         if teacher is not None:
@@ -367,6 +425,7 @@ class Trainer(object):
             'kd': None,
             'cons': None,
             'anti': None,
+            'conf': None,
         }
 
         # ===== WRCD-V2：teacher waveform KD =====
@@ -390,10 +449,28 @@ class Trainer(object):
             metrics['anti'] = torch.relu(anti_score - self.anti_sisnr_margin).mean()
             loss = loss + self.lambda_anti * metrics['anti']
 
+        # ===== TCCTCN-V4：target-interferer margin，直接抑制 target-confusion =====
+        # anti loss 只问 est 像不像 interferer；这里进一步要求：
+        # SI-SDR(est, target) >= SI-SDR(est, interferer) + confusion_margin。
+        # 当输出更接近干扰人时，该项才明显触发。
+        if self.lambda_confusion > 0:
+            interferer = mixture[:, :min_len].float() - source_loss
+            target_score = sisnr(estimate_source_loss, source_loss)
+            interferer_score = sisnr(estimate_source_loss, interferer)
+            metrics['conf'] = torch.relu(
+                self.confusion_margin + interferer_score - target_score
+            ).mean()
+            loss = loss + self.lambda_confusion * metrics['conf']
+
         return loss, metrics
 
     def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start):
-        if metrics['kd'] is None and metrics['cons'] is None and metrics['anti'] is None:
+        if (
+            metrics['kd'] is None
+            and metrics['cons'] is None
+            and metrics['anti'] is None
+            and metrics['conf'] is None
+        ):
             self.logger.info(
                 'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
                 'Current Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
@@ -409,10 +486,12 @@ class Trainer(object):
         kd_value = metrics['kd'].item() if metrics['kd'] is not None else 0.0
         cons_value = metrics['cons'].item() if metrics['cons'] is not None else 0.0
         anti_value = metrics['anti'].item() if metrics['anti'] is not None else 0.0
+        conf_value = metrics['conf'].item() if metrics['conf'] is not None else 0.0
         self.logger.info(
             'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
             'Current Loss {3:3.6f} | Sup {4:3.6f} | KD {5:3.6f} | '
-            'Cons {6:3.6f} | Anti {7:3.6f} | {8:5.1f} ms/batch'.format(
+            'Cons {6:3.6f} | Anti {7:3.6f} | Conf {8:3.6f} | '
+            '{9:5.1f} ms/batch'.format(
                 epoch + 1,
                 i + 1,
                 average_loss,
@@ -421,6 +500,7 @@ class Trainer(object):
                 kd_value,
                 cons_value,
                 anti_value,
+                conf_value,
                 1000 * (time.time() - start) / (i + 1),
             )
         )

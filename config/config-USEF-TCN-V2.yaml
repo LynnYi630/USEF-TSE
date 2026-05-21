@@ -14,6 +14,7 @@ name: USEF-TCN-V2/wsj0-2mix
 freeze_frontend_warmup: False
 frontend_warmup_epochs: 3
 frontend_unfreeze_lr_scale: 0.1
+separate_frontend_backend_lr: True
 
 epochs: 150
 batch_size: 4

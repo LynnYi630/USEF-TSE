@@ -1,36 +1,35 @@
 optimizer: !name:torch.optim.Adam
-    lr: 0.0001
+    lr: 0.00003
     weight_decay: 0
 
 checkpoint: 1
-continue_from: 'chkpt/USEF-TCN-V2-WRCD-V2/wsj0-2mix/epoch58.pth.tar'
+continue_from: 'chkpt/USEF-TCN-V2-WRCD-V2/wsj0-2mix/temp_best.pth.tar'
+reset_epoch_on_continue: True
+load_optimizer_state: False
 max_norm: 5
 use_amp: True
 amp_dtype: bfloat16
 print_freq: 100
-name: USEF-TCN-V2-WRCD-V2/wsj0-2mix
+name: USEF-TCN-V2-WRCD-V2-CONF005-AUXAUG/wsj0-2mix
 
 # frontend freezing control
 freeze_frontend_warmup: False
 frontend_warmup_epochs: 10
 frontend_unfreeze_lr_scale: 0.1
-separate_frontend_backend_lr: False
+separate_frontend_backend_lr: True
 
-epochs: 200
-batch_size: 4
+epochs: 40
+batch_size: 2
 num_workers: 8
 valid_batch_size: 1
 
 num_spks: 1
 duration: 4
 sample_rate: 8000
-# Validation-only controls:
-# valid_chunk_* makes trainer validation run long mixtures in chunks to reduce GPU memory.
-# valid_wake_aux_duration caps the enrollment/aux audio length passed by te_dataset.
 valid_chunk_duration: 4
 valid_chunk_hop_duration: 4
 
-dataset_type: wsj0-2mix  # [wsj0-2mix, libri2mix]
+dataset_type: wsj0-2mix
 train_path: data/train/wsj0-2mix
 valid_path: data/dev/wsj0-2mix
 test_path: data/test/wsj0-2mix
@@ -39,16 +38,21 @@ mix_scp: mix.scp
 ref_scp: ref.scp
 aux_scp: aux.scp
 
-# WRCD-V2: short wake-word aux/enrollment + waveform teacher distillation + aux consistency.
+# WRCD-V2 baseline terms: keep the strong TFGridNet teacher and consistency.
 use_short_aux: True
 use_wrcd: True
-use_wrcd_consistency: True # V2
+use_wrcd_consistency: True
 teacher_cache_dir: teacher_cache/USEF-TFGridNet/wsj0-2mix/train
 lambda_kd: 0.2
-lambda_cons: 0.05 # V2
+lambda_cons: 0.05
 
-# Keep min=max for the first run. Use 0.5 / 1.0 / 1.5 as separate ablations.
-train_wake_aux_duration: 1.0
+# CONF005-AUXAUG: margin loss plus randomized wake/enrollment crop length.
+lambda_confusion: 0.05
+confusion_margin: 3.0
+lambda_anti: 0.0
+
+train_wake_aux_min_duration: 0.5
+train_wake_aux_max_duration: 2.0
 valid_wake_aux_duration: 1.0
 
 # Encoder parameters
@@ -64,10 +68,10 @@ tcn_skip_channels: 256
 tcn_kernel_size: 3
 tcn_num_blocks: 8
 tcn_num_repeats: 3
-tcn_norm: gln          # fln is frame-wise LN; gln/gn/bn are also supported.
-tcn_causal: False      # True uses left padding in depthwise convolutions.
+tcn_norm: gln
+tcn_causal: False
 tcn_dropout: 0.0
-mask_activation: relu # sigmoid/relu/softplus/none
+mask_activation: sigmoid
 
 Encoder: !new:models.model_USEF_TCN_V2.Encoder
     kernel_size: !ref <kernel_size>

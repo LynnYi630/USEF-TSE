@@ -93,6 +93,61 @@ def copy_effective_config(src_path, dst_path, args, config):
         f.write(config_text)
 
 
+def build_optimizer_params(model, config, logger):
+    """Build optimizer params.
+
+    By default all trainable parameters share one optimizer group. When
+    separate_frontend_backend_lr=True, split frontend modules into a named
+    group so Trainer can lower only the frontend LR after warm-up.
+    """
+    if not bool(config.get('separate_frontend_backend_lr', False)):
+        return list(filter(lambda p: p.requires_grad, model.parameters()))
+
+    model_for_groups = model.module if hasattr(model, 'module') else model
+    frontend_param_ids = set()
+    for module_name in (
+        'encoder',
+        'decoder',
+        'conv1d1',
+        'fusion_mdl',
+        'fusion_norm',
+        'film',
+    ):
+        module = getattr(model_for_groups, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            frontend_param_ids.add(id(param))
+
+    frontend_params = []
+    backend_params = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in frontend_param_ids:
+            frontend_params.append(param)
+        else:
+            backend_params.append(param)
+
+    param_groups = []
+    if frontend_params:
+        param_groups.append({'params': frontend_params, 'name': 'frontend'})
+    if backend_params:
+        param_groups.append({'params': backend_params, 'name': 'backend'})
+
+    if not param_groups:
+        raise RuntimeError('No trainable parameters found for optimizer')
+
+    logger.info(
+        'Optimizer param groups enabled: frontend=%d params, backend=%d params'
+        % (
+            sum(p.numel() for p in frontend_params),
+            sum(p.numel() for p in backend_params),
+        )
+    )
+    return param_groups
+
+
 def main(config, args):
     apply_dataset_args(config, args)
 
@@ -173,7 +228,7 @@ def main(config, args):
     copy_effective_config(args.config, os.path.join(chkpt_dir, 'config.yaml'), args, config)
     shutil.copyfile(inspect.getmodule(config['MaskNet'].__class__).__file__, os.path.join(chkpt_dir, 'model.py'))
 
-    model_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    model_params = build_optimizer_params(model, config, logger)
     optimizer = config['optimizer'](params=model_params)
     lr_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8)
 
