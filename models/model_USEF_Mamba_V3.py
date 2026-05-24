@@ -1,18 +1,27 @@
 """
-USEF target speaker extraction with a configurable Conv-TasNet style TCN backend.
+USEF-Mamba V3: Mamba-2 backend with bidirectional + skip aggregation.
 
-TCN-V2 keeps the USEF encoder/fusion/FiLM interface, but replaces the minimal
-TCN backend with:
-  - configurable block/repeat/channel settings,
-  - frame-wise normalization by default,
-  - residual plus skip aggregation,
-  - causal or non-causal depthwise convolution,
-  - a bounded mask option for more stable early training.
+Key differences vs V2:
+  - Uses Mamba2 (structured state space duality, ICML 2024) instead of Mamba-1.
+    Mamba-2 uses larger d_state (128 vs 64) at lower compute cost via the
+    chunked scan algorithm, and is generally faster on modern GPUs.
+  - Same bidirectional + skip aggregation pattern as V2; these are about
+    speech separation specifically, not the SSM block choice.
+  - Same forward signature as V2 so configs/eval scripts can be reused.
+  - Keeps a local normalization selector. ``cln`` routes to real cumulative
+    layer norm, while ``fln`` stays frame-wise.
+
+Mamba-2 constraint: (d_model * expand) must be divisible by headdim.
+With d_model=256, expand=2, headdim=64 -> (256*2)/64 = 8 heads. OK.
 """
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mamba_ssm import Mamba2
 
 from models.local.normalization import (
     CumulativeLayerNorm,
@@ -78,114 +87,88 @@ class Decoder(nn.ConvTranspose1d):
         return torch.squeeze(x)
 
 
-class DepthwiseSeparableConv1d(nn.Module):
-    def __init__(self, channels, kernel_size, dilation=1, causal=False, bias=False):
+class BidirectionalMamba2Layer(nn.Module):
+    """One Mamba-2 block with forward + reversed pass.
+
+    Forward and backward Mamba-2 do not share params. Their outputs are summed
+    before residual add.
+    """
+
+    def __init__(self, d_model, d_state=128, d_conv=4, expand=2, headdim=64, dropout=0.0):
         super().__init__()
-        self.causal = bool(causal)
-        self.left_padding = (kernel_size - 1) * dilation
-        padding = 0 if self.causal else self.left_padding // 2
-        self.depthwise = nn.Conv1d(
-            channels,
-            channels,
-            kernel_size=kernel_size,
-            groups=channels,
-            dilation=dilation,
-            padding=padding,
-            bias=bias,
+        self.norm = nn.LayerNorm(d_model)
+        self.fwd = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
         )
-
-    def forward(self, x):
-        if self.causal and self.left_padding > 0:
-            x = F.pad(x, (self.left_padding, 0))
-        return self.depthwise(x)
-
-
-class TCNBlockV2(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        conv_channels,
-        skip_channels,
-        kernel_size,
-        dilation,
-        norm="fln",
-        causal=False,
-        dropout=0.0,
-    ):
-        super().__init__()
-        self.in_proj = nn.Conv1d(in_channels, conv_channels, 1, bias=False)
-        self.prelu1 = nn.PReLU()
-        self.norm1 = select_norm(norm, conv_channels)
-
-        self.dconv = DepthwiseSeparableConv1d(
-            conv_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            causal=causal,
-            bias=False,
+        self.bwd = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
         )
-        self.prelu2 = nn.PReLU()
-        self.norm2 = select_norm(norm, conv_channels)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        self.res_proj = nn.Conv1d(conv_channels, in_channels, 1, bias=False)
-        self.skip_proj = nn.Conv1d(conv_channels, skip_channels, 1, bias=False)
+        # See V2: 1/sqrt(2) on (fwd+bwd) keeps post-merge variance stable.
+        self._bidir_scale = 1.0 / math.sqrt(2.0)
 
     def forward(self, x):
         residual = x
-        y = self.in_proj(x)
-        y = self.prelu1(y)
-        y = self.norm1(y)
-        y = self.dconv(y)
-        y = self.prelu2(y)
-        y = self.norm2(y)
+        y = self.norm(x)
+        fwd = self.fwd(y)
+        bwd = torch.flip(self.bwd(torch.flip(y, dims=[1])), dims=[1])
+        y = (fwd + bwd) * self._bidir_scale
         y = self.dropout(y)
-
-        residual_out = residual + self.res_proj(y)
-        skip = self.skip_proj(y)
-        return residual_out, skip
+        return residual + y
 
 
-class TCNBackendV2(nn.Module):
+class Mamba2BackendV3(nn.Module):
+    """Bidirectional Mamba-2 stack with TCN-style skip aggregation."""
+
     def __init__(
         self,
         in_channels=256,
-        conv_channels=512,
         skip_channels=256,
-        kernel_size=3,
-        num_blocks=8,
-        num_repeats=3,
-        norm="fln",
-        causal=False,
+        num_layers=8,
+        d_state=128,
+        d_conv=4,
+        expand=2,
+        headdim=64,
         dropout=0.0,
     ):
         super().__init__()
-        blocks = []
-        for _ in range(num_repeats):
-            for block_idx in range(num_blocks):
-                blocks.append(
-                    TCNBlockV2(
-                        in_channels=in_channels,
-                        conv_channels=conv_channels,
-                        skip_channels=skip_channels,
-                        kernel_size=kernel_size,
-                        dilation=2 ** block_idx,
-                        norm=norm,
-                        causal=causal,
-                        dropout=dropout,
-                    )
-                )
-        self.blocks = nn.ModuleList(blocks)
+        self.layers = nn.ModuleList(
+            BidirectionalMamba2Layer(
+                d_model=in_channels,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                headdim=headdim,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        )
+        self.skip_projs = nn.ModuleList(
+            nn.Linear(in_channels, skip_channels) for _ in range(num_layers)
+        )
+        # See V2: 1/sqrt(N) skip scaling keeps mask logits from growing with depth.
+        self._skip_scale = 1.0 / math.sqrt(float(num_layers))
 
-    def forward(self, x):
+    def forward(self, x_btc):
         skip_sum = None
-        for block in self.blocks:
-            x, skip = block(x)
+        for layer, skip_proj in zip(self.layers, self.skip_projs):
+            x_btc = layer(x_btc)
+            skip = skip_proj(x_btc)
             skip_sum = skip if skip_sum is None else skip_sum + skip
-        return x, skip_sum
+        return x_btc, skip_sum * self._skip_scale
 
 
 class Tar_Model(nn.Module):
+    """USEF target speaker extraction with Mamba-2 backend."""
+
     def __init__(
         self,
         encoder,
@@ -195,14 +178,14 @@ class Tar_Model(nn.Module):
         in_channels,
         out_channels,
         num_spks=1,
-        tcn_conv_channels=512,
-        tcn_skip_channels=256,
-        tcn_kernel_size=3,
-        tcn_num_blocks=8,
-        tcn_num_repeats=3,
-        tcn_norm="fln",
-        tcn_causal=False,
-        tcn_dropout=0.0,
+        mamba_num_layers=8,
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_expand=2,
+        mamba_headdim=64,
+        mamba_dropout=0.0,
+        skip_channels=256,
+        norm="gln",
         mask_activation="sigmoid",
         **kwargs,
     ):
@@ -213,32 +196,27 @@ class Tar_Model(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-        self.norm_m = select_norm(tcn_norm, in_channels)
+        self.norm_m = select_norm(norm, in_channels)
         self.conv1d1 = nn.Conv1d(in_channels, out_channels, 1, bias=False)
 
         self.fusion_mdl = fusion_mdl
-        self.fusion_norm = select_norm(tcn_norm, out_channels)
+        self.fusion_norm = select_norm(norm, out_channels)
         self.film = film
 
-        self.tcn_backend = TCNBackendV2(
+        self.backend = Mamba2BackendV3(
             in_channels=out_channels,
-            conv_channels=tcn_conv_channels,
-            skip_channels=tcn_skip_channels,
-            kernel_size=tcn_kernel_size,
-            num_blocks=tcn_num_blocks,
-            num_repeats=tcn_num_repeats,
-            norm=tcn_norm,
-            causal=tcn_causal,
-            dropout=tcn_dropout,
+            skip_channels=skip_channels,
+            num_layers=mamba_num_layers,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            headdim=mamba_headdim,
+            dropout=mamba_dropout,
         )
 
         self.skip_prelu = nn.PReLU()
-        self.skip_norm = select_norm(tcn_norm, tcn_skip_channels)
-        self.mask_conv1x1 = nn.Conv1d(
-            tcn_skip_channels,
-            out_channels * num_spks,
-            kernel_size=1,
-        )
+        self.skip_norm = select_norm(norm, skip_channels)
+        self.mask_conv1x1 = nn.Conv1d(skip_channels, out_channels * num_spks, 1)
 
     def _apply_mask_activation(self, x):
         if self.mask_activation == "sigmoid":
@@ -269,8 +247,11 @@ class Tar_Model(nn.Module):
 
         x = x_seq.permute(0, 2, 1).contiguous()
         x = self.fusion_norm(x)
+        x = x.permute(0, 2, 1).contiguous()
 
-        _residual, skip = self.tcn_backend(x)
+        _residual, skip = self.backend(x)
+
+        skip = skip.permute(0, 2, 1).contiguous()
         x = self.skip_prelu(skip)
         x = self.skip_norm(x)
         x = self.mask_conv1x1(x)

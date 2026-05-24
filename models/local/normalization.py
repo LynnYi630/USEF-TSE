@@ -9,6 +9,163 @@ import torch
 import torch.nn as nn
 
 
+class FramewiseLayerNorm(nn.Module):
+    """Applies frame-wise layer normalization to a 3d tensor.
+
+    This module expects channel-first temporal features with shape
+    ``[batch, channels, time]``. For every batch item and time frame, it
+    normalizes only across the channel dimension. It does not use statistics
+    from neighboring frames, so it is suitable for causal temporal backends.
+
+    Arguments
+    ---------
+    channels : int
+        Number of channels in the input tensor.
+    eps : float
+        This value is added to variance estimation to improve numerical
+        stability.
+
+    Example
+    -------
+    >>> input = torch.randn(8, 256, 100)
+    >>> norm = FramewiseLayerNorm(256)
+    >>> output = norm(input)
+    >>> output.shape
+    torch.Size([8, 256, 100])
+    """
+
+    def __init__(self, channels, eps=1e-8):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x):
+        """Returns the normalized input tensor.
+
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor with shape ``[batch, channels, time]``.
+        """
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        return x.transpose(1, 2)
+
+
+class GlobalLayerNorm(nn.Module):
+    """Applies global layer normalization to a 3d tensor.
+
+    This module expects channel-first temporal features with shape
+    ``[batch, channels, time]``. For each batch item, it computes one mean and
+    variance over both the channel and time dimensions, then applies learnable
+    per-channel affine parameters.
+
+    Arguments
+    ---------
+    channels : int
+        Number of channels in the input tensor.
+    eps : float
+        This value is added to variance estimation to improve numerical
+        stability.
+
+    Example
+    -------
+    >>> input = torch.randn(8, 256, 100)
+    >>> norm = GlobalLayerNorm(256)
+    >>> output = norm(input)
+    >>> output.shape
+    torch.Size([8, 256, 100])
+    """
+
+    def __init__(self, channels, eps=1e-8):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        """Returns the normalized input tensor.
+
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor with shape ``[batch, channels, time]``.
+        """
+        dtype = x.dtype
+        x_float = x.float()
+        mean = x_float.mean(dim=(1, 2), keepdim=True)
+        var = x_float.var(dim=(1, 2), keepdim=True, unbiased=False)
+        x_norm = (x_float - mean) / torch.sqrt(var + self.eps)
+        x_norm = self.gamma.float() * x_norm + self.beta.float()
+        return x_norm.to(dtype)
+
+
+class CumulativeLayerNorm(nn.Module):
+    """Applies cumulative layer normalization to a 3d tensor.
+
+    This module expects channel-first temporal features with shape
+    ``[batch, channels, time]``. At time frame ``t``, statistics are computed
+    over all channels and over frames ``[0, t]`` only. This makes the layer
+    causal and distinct from both frame-wise layer normalization and global
+    layer normalization.
+
+    Arguments
+    ---------
+    channels : int
+        Number of channels in the input tensor.
+    eps : float
+        This value is added to variance estimation to improve numerical
+        stability.
+
+    Example
+    -------
+    >>> input = torch.randn(8, 256, 100)
+    >>> norm = CumulativeLayerNorm(256)
+    >>> output = norm(input)
+    >>> output.shape
+    torch.Size([8, 256, 100])
+    """
+
+    def __init__(self, channels, eps=1e-8):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        """Returns the normalized input tensor.
+
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor with shape ``[batch, channels, time]``.
+        """
+        dtype = x.dtype
+        x_float = x.float()
+        _, channels, frames = x_float.shape
+
+        sum_c = x_float.sum(dim=1, keepdim=True)
+        sumsq_c = (x_float ** 2).sum(dim=1, keepdim=True)
+
+        cum_sum = sum_c.cumsum(dim=2)
+        cum_sumsq = sumsq_c.cumsum(dim=2)
+
+        count = torch.arange(
+            1,
+            frames + 1,
+            device=x.device,
+            dtype=x_float.dtype,
+        ) * channels
+        count = count.view(1, 1, frames)
+
+        mean = cum_sum / count
+        var = cum_sumsq / count - mean ** 2
+        var = var.clamp(min=0.0)
+
+        x_norm = (x_float - mean) / torch.sqrt(var + self.eps)
+        x_norm = self.gamma.float() * x_norm + self.beta.float()
+        return x_norm.to(dtype)
+
+
 class BatchNorm1d(nn.Module):
     """Applies 1d batch normalization to the input tensor.
 

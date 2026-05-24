@@ -1,0 +1,18 @@
+Target Confusion Diagnosis
+======================================================================
+Analyzed utterances: 455
+
+Class counts:
+  target_degradation: 197
+  target_confusion: 162
+  low_quality_or_silence: 91
+  weak_target_or_ambiguous: 5
+
+Averages:
+  selected eval metric: -6.0847 dB
+  est vs target SI-SDR: -5.5729 dB
+  est vs interferer SI-SDR: -3.5285 dB
+  target - interferer SI-SDR margin: -2.0444 dB
+
+Outputs:
+  eval_logs\USEF-TCN-V2-WRCD-V2\wsj0-2mix\diagnosis_si_sdri_lt5_all\target_confusion_diagnosis.csv

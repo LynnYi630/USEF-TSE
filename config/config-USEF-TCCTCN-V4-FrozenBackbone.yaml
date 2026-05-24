@@ -1,0 +1,133 @@
+optimizer: !name:torch.optim.Adam
+  # 主干已冻；adapter 是从零学起的小模块，需要比 V4-From-WRCD 的 5e-5 大一些的 lr。
+  lr: 0.0002
+  weight_decay: 0
+
+checkpoint: 1
+# 用最稳的 TCN-V2-WRCD-V2 主干做初始化。后面 freeze_backbone 会把它冻住。
+continue_from: 'chkpt/USEF-TCN-V2-WRCD-V2/wsj0-2mix/temp_best.pth.tar'
+reset_epoch_on_continue: True
+load_optimizer_state: False
+max_norm: 5
+use_amp: True
+amp_dtype: bfloat16
+print_freq: 100
+name: USEF-TCCTCN-V4-FrozenBackbone/wsj0-2mix
+
+# Frontend 也冻住前 5 epoch 给 adapter 一段“纯冷启动”时间，再解冻 frontend 协同微调。
+# 注意：frontend = encoder/decoder/conv1d1/fusion_mdl/fusion_norm/film。
+freeze_frontend_warmup: True
+frontend_warmup_epochs: 5
+frontend_unfreeze_lr_scale: 0.1
+separate_frontend_backend_lr: True
+
+# 关键：永久冻结 TCN backbone（tcn_backend.blocks 里的 24 个 TCNBlockV2）。
+# repeat_adapters 和 adapter_scale_logit 始终可训练。
+freeze_backbone: True
+
+# 训得短一些，因为 trainable params 大幅减少，收敛会快。
+# 如果 30 epoch 没收敛再延长。
+epochs: 40
+batch_size: 4
+num_workers: 8
+valid_batch_size: 1
+num_spks: 1
+
+duration: 4
+sample_rate: 8000
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
+valid_wake_aux_duration: 3
+
+dataset_type: wsj0-2mix
+train_path: data/train/wsj0-2mix
+valid_path: data/dev/wsj0-2mix
+test_path: data/test/wsj0-2mix
+
+mix_scp: mix.scp
+ref_scp: ref.scp
+aux_scp: aux.scp
+
+# Encoder parameters
+N_encoder_out: 256
+out_channels: 256
+encoder_kernel_size: 16
+encoder_kernel_stride: 8
+embd: 256
+
+# 主干 — 必须和 chkpt/USEF-TCN-V2-WRCD-V2 对齐才能加载。
+tcn_conv_channels: 512
+tcn_skip_channels: 256
+tcn_kernel_size: 3
+tcn_num_blocks: 8
+tcn_num_repeats: 3
+tcn_norm: gln
+tcn_causal: False
+tcn_dropout: 0.0
+mask_activation: sigmoid
+
+# V4 adapter — 保留诊断显示有效的部件，删掉无效的 reliability_gate。
+adapter_bottleneck_channels: 256
+adapter_scale_init_logit: -3.0
+adapter_scale_trainable: True
+# 诊断结果：reliability_gate 是死参数（bias 几乎没动，强制为 1 几乎不影响性能）。
+# 关掉它能省参数、省显存、降低过拟合风险。
+use_reliability_gate: False
+need_gate_init_bias: 0.0
+reliability_gate_init_bias: 2.0
+zero_init_adapter_delta: True
+
+# 损失：先不开 confusion，纯 SI-SNR 看 adapter 真实贡献。
+lambda_anti: 0.0
+anti_sisnr_margin: 0.0
+lambda_confusion: 0.0
+confusion_margin: 0.0
+
+Encoder: !new:models.model_USEF_TCCTCN_V4.Encoder
+  kernel_size: !ref <encoder_kernel_size>
+  out_channels: !ref <N_encoder_out>
+
+Decoder: !new:models.model_USEF_TCCTCN_V4.Decoder
+  in_channels: !ref <N_encoder_out>
+  out_channels: 1
+  kernel_size: !ref <encoder_kernel_size>
+  stride: !ref <encoder_kernel_stride>
+  bias: False
+
+Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
+  num_layers: 4
+  d_model: !ref <out_channels>
+  nhead: 8
+  d_ffn: 1024
+  dropout: 0
+
+FiLM: !new:models.model_USEF_TCCTCN_V4.FiLM
+  size: !ref <out_channels>
+
+MaskNet: !new:models.model_USEF_TCCTCN_V4.Tar_Model
+  encoder: !ref <Encoder>
+  decoder: !ref <Decoder>
+  fusion_mdl: !ref <Fusion_mdl>
+  film: !ref <FiLM>
+  in_channels: !ref <N_encoder_out>
+  out_channels: !ref <out_channels>
+  num_spks: !ref <num_spks>
+  tcn_conv_channels: !ref <tcn_conv_channels>
+  tcn_skip_channels: !ref <tcn_skip_channels>
+  tcn_kernel_size: !ref <tcn_kernel_size>
+  tcn_num_blocks: !ref <tcn_num_blocks>
+  tcn_num_repeats: !ref <tcn_num_repeats>
+  tcn_norm: !ref <tcn_norm>
+  tcn_causal: !ref <tcn_causal>
+  tcn_dropout: !ref <tcn_dropout>
+  mask_activation: !ref <mask_activation>
+  adapter_bottleneck_channels: !ref <adapter_bottleneck_channels>
+  adapter_scale_init_logit: !ref <adapter_scale_init_logit>
+  adapter_scale_trainable: !ref <adapter_scale_trainable>
+  use_reliability_gate: !ref <use_reliability_gate>
+  need_gate_init_bias: !ref <need_gate_init_bias>
+  reliability_gate_init_bias: !ref <reliability_gate_init_bias>
+  zero_init_adapter_delta: !ref <zero_init_adapter_delta>
+
+modules:
+  masknet: !ref <MaskNet>

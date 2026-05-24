@@ -3,7 +3,7 @@ optimizer: !name:torch.optim.Adam
     weight_decay: 0
 
 checkpoint: 1
-continue_from: 'chkpt/USEF-TCN-V2-WRCD-V2/wsj0-2mix/epoch58.pth.tar'
+continue_from: 'chkpt/init_frontend_from_sepformer_wsj0-2mix_for_tcn_v2.pth.tar'
 max_norm: 5
 use_amp: True
 amp_dtype: bfloat16
@@ -14,10 +14,10 @@ name: USEF-TCN-V2-WRCD-V2/wsj0-2mix
 freeze_frontend_warmup: False
 frontend_warmup_epochs: 10
 frontend_unfreeze_lr_scale: 0.1
-separate_frontend_backend_lr: False
+separate_frontend_backend_lr: True
 
 epochs: 200
-batch_size: 4
+batch_size: 2
 num_workers: 8
 valid_batch_size: 1
 
@@ -67,7 +67,7 @@ tcn_num_repeats: 3
 tcn_norm: gln          # fln is frame-wise LN; gln/gn/bn are also supported.
 tcn_causal: False      # True uses left padding in depthwise convolutions.
 tcn_dropout: 0.0
-mask_activation: relu # sigmoid/relu/softplus/none
+mask_activation: sigmoid # sigmoid/relu/softplus/none
 
 Encoder: !new:models.model_USEF_TCN_V2.Encoder
     kernel_size: !ref <kernel_size>

@@ -15,24 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-EPS = 1e-8
-
-
-class FramewiseLayerNorm(nn.Module):
-    """LayerNorm over channels independently at each frame.
-
-    Input/Output: [B, C, T]. Unlike GroupNorm(1, C) or GlobalLayerNorm,
-    this does not use statistics from future frames.
-    """
-
-    def __init__(self, channels, eps=1e-8):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels, eps=eps)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)      # [B, T, C]
-        x = self.norm(x)
-        return x.transpose(1, 2)   # [B, C, T]
+from models.local.normalization import FramewiseLayerNorm
 
 
 def select_norm(norm, dim, shape=None, eps=1e-8):

@@ -6,8 +6,7 @@ Oriented for low-latency edge device deployment.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# === [修改 1/5]: 移除了 PositionalEncoding 的引入，因为 TCN 不需要绝对位置编码 ===
+from models.local.normalization import GlobalLayerNorm
 
 EPS = 1e-8
 
@@ -65,20 +64,6 @@ class Decoder(nn.ConvTranspose1d):
         return x
 
 
-# === [修改 2/5]: 彻底删除了庞大的 Interblock (Transformer双路径) 模块 ===
-# === 新增轻量级的 TCN 模块组 (GlobalLayerNorm, TCNBlock, TCNBackend) ===
-class GlobalLayerNorm(nn.Module):
-    def __init__(self, channel_size):
-        super(GlobalLayerNorm, self).__init__()
-        self.gamma = nn.Parameter(torch.ones(1, channel_size, 1))
-        self.beta = nn.Parameter(torch.zeros(1, channel_size, 1))
-
-    def forward(self, y):
-        mean = y.mean(dim=(1, 2), keepdim=True)
-        var = y.var(dim=(1, 2), keepdim=True)
-        y_normalized = (y - mean) / (var + 1e-8)**0.5
-        return self.gamma * y_normalized + self.beta
-
 class TCNBlock(nn.Module):
     def __init__(self, in_channels, conv_channels, kernel_size, dilation):
         super(TCNBlock, self).__init__()
@@ -120,7 +105,6 @@ class TCNBackend(nn.Module):
         
     def forward(self, x):
         return self.tcn_network(x)
-# =========================================================================
 
 
 class Tar_Model(nn.Module):
@@ -144,11 +128,9 @@ class Tar_Model(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-        # === [修改 3/5]: TCN 处理的是 1D 序列，所以把原来的 Conv2d 替换为 Conv1d ===
         self.out_conv1d = nn.Conv1d(
             out_channels, out_channels * num_spks, kernel_size=1
         )
-        # =========================================================================
 
         self.end_conv1x1 = nn.Conv1d(out_channels, out_channels, 1, bias=False)
         self.prelu = nn.PReLU()
@@ -165,7 +147,6 @@ class Tar_Model(nn.Module):
         self.fusion_norm = select_norm("ln", out_channels, 3)
         self.film = film
         
-        # === [修改 4/5]: 实例化 TCN 后端，完全取代之前的 self.dual_mdl 循环列表 ===
         self.tcn_backend = TCNBackend(
             in_channels=out_channels, 
             conv_channels=512, 
@@ -173,7 +154,6 @@ class Tar_Model(nn.Module):
             num_blocks=8, 
             num_repeats=3
         )
-        # =========================================================================
 
 
     def forward(self, input, aux):
@@ -197,7 +177,6 @@ class Tar_Model(nn.Module):
         # 此处 x 的维度变为 [B, out_channels, L]，完美适配 TCN 的输入要求
         x = self.fusion_norm(x.permute(0,2,1).contiguous())
 
-        # === [修改 5/5]: 删除了原有的 _Segmentation 切块机制和循环调用 ===
         # 直接将完整时序特征送入 TCN，无需再切成 3D 张量
         x = self.tcn_backend(x)
         
@@ -208,7 +187,6 @@ class Tar_Model(nn.Module):
         
         B, _, L = x.shape
         x = x.view(B * self.num_spks, -1, L)
-        # ================================================================
 
         x = self.output(x) * self.output_gate(x)
         x = self.end_conv1x1(x)
@@ -238,4 +216,3 @@ class Tar_Model(nn.Module):
 
         return est_source.squeeze(-1)
     
-    # === [清理]: 彻底删除了原有的 _padding, _Segmentation 和 _over_add 三个成员函数 ===

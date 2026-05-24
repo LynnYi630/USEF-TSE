@@ -15,13 +15,92 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.model_USEF_TCN_V2 import (
-    Decoder,
-    Encoder,
-    FiLM,
-    TCNBlockV2,
-    select_norm,
+from models.local.normalization import (
+    CumulativeLayerNorm,
+    FramewiseLayerNorm,
+    GlobalLayerNorm,
 )
+
+from model_USEF_TCN_V2 import TCNBlockV2
+
+
+def select_norm(norm, channels, shape=None, eps=1e-8):
+    norm = (norm or "fln").lower()
+    if norm in {"fln", "frame_ln", "framewise_ln"}:
+        return FramewiseLayerNorm(channels, eps=eps)
+    if norm in {"cln", "cumulative_ln"}:
+        return CumulativeLayerNorm(channels, eps=eps)
+    if norm in {"gln", "global_ln"}:
+        return GlobalLayerNorm(channels, eps=eps)
+    if norm in {"gn", "ln", "groupnorm"}:
+        return nn.GroupNorm(1, channels, eps=eps)
+    if norm in {"bn", "batchnorm", "batch_norm"}:
+        return nn.BatchNorm1d(channels, eps=eps)
+    raise ValueError("Unsupported norm type: {}".format(norm))
+
+
+class FiLM(nn.Module):
+    def __init__(self, size=256):
+        super().__init__()
+        self.linear1 = nn.Linear(size, size)
+        self.linear2 = nn.Linear(size, size)
+
+    def forward(self, x, aux):
+        return x * self.linear1(aux) + self.linear2(aux)
+
+
+class Encoder(nn.Module):
+    def __init__(self, kernel_size=2, out_channels=64, in_channels=1):
+        super().__init__()
+        self.conv1d = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=kernel_size // 2,
+            groups=1,
+            bias=False,
+        )
+        self.in_channels = in_channels
+
+    def forward(self, x):
+        if self.in_channels == 1:
+            x = torch.unsqueeze(x, dim=1)
+        return F.relu(self.conv1d(x))
+
+
+class Decoder(nn.ConvTranspose1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x):
+        if x.dim() not in [2, 3]:
+            raise RuntimeError("Decoder expects a 2D or 3D tensor as input")
+        x = super().forward(x if x.dim() == 3 else torch.unsqueeze(x, 1))
+        if torch.squeeze(x).dim() == 1:
+            return torch.squeeze(x, dim=1)
+        return torch.squeeze(x)
+
+
+class DepthwiseSeparableConv1d(nn.Module):
+    def __init__(self, channels, kernel_size, dilation=1, causal=False, bias=False):
+        super().__init__()
+        self.causal = bool(causal)
+        self.left_padding = (kernel_size - 1) * dilation
+        padding = 0 if self.causal else self.left_padding // 2
+        self.depthwise = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            groups=channels,
+            dilation=dilation,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(self, x):
+        if self.causal and self.left_padding > 0:
+            x = F.pad(x, (self.left_padding, 0))
+        return self.depthwise(x)
 
 
 class RepeatSkipConditionAdapter(nn.Module):
@@ -253,6 +332,21 @@ class Tar_Model(nn.Module):
             out_channels * num_spks,
             kernel_size=1,
         )
+
+    def freeze_backbone(self, freeze=True):
+        """Freeze (or unfreeze) the TCN-V2 trunk inside tcn_backend.
+
+        Only the unconditioned TCNBlockV2 stack is touched. The repeat-level
+        adapters and adapter_scale_logit remain trainable, so the model can
+        still learn the V4 conditioning path on top of a fixed backbone.
+        Returns the count of parameters whose requires_grad changed.
+        """
+        changed = 0
+        for param in self.tcn_backend.blocks.parameters():
+            if param.requires_grad == (not freeze):
+                param.requires_grad = not freeze
+                changed += param.numel()
+        return changed
 
     def _apply_mask_activation(self, x):
         activation = (self.mask_activation or "none").lower()

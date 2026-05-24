@@ -16,38 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class FramewiseLayerNorm(nn.Module):
-    """LayerNorm over channels independently at each frame.
-
-    Input/output shape: [B, C, T].
-    """
-
-    def __init__(self, channels, eps=1e-8):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels, eps=eps)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        x = self.norm(x)
-        return x.transpose(1, 2)
-
-
-class GlobalLayerNorm(nn.Module):
-    def __init__(self, channels, eps=1e-8):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(1, channels, 1))
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1))
-        self.eps = eps
-
-    def forward(self, x):
-        dtype = x.dtype
-        x_float = x.float()
-        mean = x_float.mean(dim=(1, 2), keepdim=True)
-        var = x_float.var(dim=(1, 2), keepdim=True, unbiased=False)
-        x_norm = (x_float - mean) / torch.sqrt(var + self.eps)
-        x_norm = self.gamma.float() * x_norm + self.beta.float()
-        return x_norm.to(dtype)
+from models.local.normalization import FramewiseLayerNorm, GlobalLayerNorm
 
 
 def select_norm(norm, channels, eps=1e-8):

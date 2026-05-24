@@ -87,6 +87,11 @@ class Trainer(object):
             config.get('separate_frontend_backend_lr', False)
         )
 
+        # ===== 永久冻结 backbone（V4 adapter-only 微调用）=====
+        # 与 frontend warmup 不同：这是“训练全程都冻”，不是 warmup。
+        # 触发条件：config.freeze_backbone=True 且 model 暴露 freeze_backbone() 方法。
+        self.freeze_backbone_full = bool(config.get('freeze_backbone', False))
+
         # ===== WRCD-V2：teacher KD + wake aux consistency =====
         # use_wrcd: 训练 batch 会额外带 teacher waveform。
         # use_wrcd_consistency: 训练 batch 会再额外带第二个 wake aux，用于一致性约束。
@@ -269,6 +274,80 @@ class Trainer(object):
             if module is not None:
                 modules.append(module)
         return modules
+
+    def _grad_norm_for_params(self, params):
+        """Return the pre-clipping L2 grad norm for a parameter iterable."""
+        norms = []
+        with torch.no_grad():
+            for param in params:
+                if param.grad is None:
+                    continue
+                grad = param.grad.detach()
+                if grad.is_sparse:
+                    grad = grad.coalesce().values()
+                norms.append(torch.linalg.vector_norm(grad.float(), 2).cpu())
+
+            if not norms:
+                return None
+            return float(torch.linalg.vector_norm(torch.stack(norms), 2).item())
+
+    def _module_grad_norms(self):
+        """Collect pre-clipping grad norms for coarse model regions."""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        groups = (
+            ('enc', ('encoder',)),
+            ('dec', ('decoder',)),
+            ('pre', ('norm_m', 'conv1d1')),
+            ('fusion', ('fusion_mdl', 'fusion_norm')),
+            ('film', ('film',)),
+            ('backend', ('backend', 'tcn_backend')),
+            ('head', ('skip_prelu', 'skip_norm', 'mask_conv1x1')),
+        )
+
+        module_norms = []
+        used_param_ids = set()
+        for group_name, module_names in groups:
+            params = []
+            for module_name in module_names:
+                module = getattr(model, module_name, None)
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    param_id = id(param)
+                    if param_id in used_param_ids:
+                        continue
+                    params.append(param)
+                    used_param_ids.add(param_id)
+            if params:
+                module_norms.append((group_name, self._grad_norm_for_params(params)))
+
+        other_params = [
+            param for param in model.parameters()
+            if id(param) not in used_param_ids
+        ]
+        other_norm = self._grad_norm_for_params(other_params)
+        if other_norm is not None:
+            module_norms.append(('other', other_norm))
+
+        return module_norms
+
+    def _clip_ratio_from_grad_norm(self, grad_norm):
+        if grad_norm <= 0:
+            return 1.0
+        if not np.isfinite(grad_norm):
+            return 0.0
+        return min(1.0, float(self.max_norm) / (grad_norm + 1e-12))
+
+    def _format_module_grad_norms(self, module_grad_norms):
+        if not module_grad_norms:
+            return 'ModuleGradNorms none'
+        parts = []
+        for name, value in module_grad_norms:
+            if value is None:
+                parts.append('%s=-' % name)
+            else:
+                parts.append('%s=%.3f' % (name, value))
+        return 'ModuleGradNorms ' + ', '.join(parts)
 
     def _freeze_frontend(self):
         """[通用 warm-up] 冻结前端模块，仅训练后端或新加模块。"""
@@ -464,7 +543,16 @@ class Trainer(object):
 
         return loss, metrics
 
-    def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start):
+    def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start, grad_stats):
+        if grad_stats is None:
+            clip_ratio = 1.0
+            module_grad_text = self._format_module_grad_norms(None)
+        else:
+            clip_ratio = grad_stats['clip_ratio']
+            module_grad_text = self._format_module_grad_norms(
+                grad_stats['module_grad_norms']
+            )
+
         if (
             metrics['kd'] is None
             and metrics['cons'] is None
@@ -473,11 +561,14 @@ class Trainer(object):
         ):
             self.logger.info(
                 'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
-                'Current Loss {3:3.6f} | {4:5.1f} ms/batch'.format(
+                'Current Loss {3:3.6f} | ClipRatio {4:3.3f} | {5} | '
+                '{6:5.1f} ms/batch'.format(
                     epoch + 1,
                     i + 1,
                     average_loss,
                     loss.item(),
+                    clip_ratio,
+                    module_grad_text,
                     1000 * (time.time() - start) / (i + 1),
                 )
             )
@@ -491,7 +582,7 @@ class Trainer(object):
             'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
             'Current Loss {3:3.6f} | Sup {4:3.6f} | KD {5:3.6f} | '
             'Cons {6:3.6f} | Anti {7:3.6f} | Conf {8:3.6f} | '
-            '{9:5.1f} ms/batch'.format(
+            'ClipRatio {9:3.3f} | {10} | {11:5.1f} ms/batch'.format(
                 epoch + 1,
                 i + 1,
                 average_loss,
@@ -501,6 +592,8 @@ class Trainer(object):
                 cons_value,
                 anti_value,
                 conf_value,
+                clip_ratio,
+                module_grad_text,
                 1000 * (time.time() - start) / (i + 1),
             )
         )
@@ -509,6 +602,9 @@ class Trainer(object):
         start = time.time()
         total_loss = 0
         num_finite_loss = 0
+        total_sup_loss = 0
+        num_sup_loss = 0
+        self.last_train_sup_loss = None
 
         for i, data in enumerate(self.tr_loader):
             batch = self._unpack_train_batch(data)
@@ -528,22 +624,53 @@ class Trainer(object):
                 )
                 continue
 
+            log_this_iter = i % self.print_freq == 0
+            module_grad_norms = None
+
             self.optimizer.zero_grad(set_to_none=True)
             if self.grad_scaler.is_enabled():
                 self.grad_scaler.scale(loss).backward()
                 self.grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                if log_this_iter:
+                    module_grad_norms = self._module_grad_norms()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.max_norm,
+                )
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
+                if log_this_iter:
+                    module_grad_norms = self._module_grad_norms()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.max_norm,
+                )
                 self.optimizer.step()
+            grad_norm = float(grad_norm.detach().cpu())
+            grad_stats = None
+            if log_this_iter:
+                grad_stats = {
+                    'clip_ratio': self._clip_ratio_from_grad_norm(grad_norm),
+                    'module_grad_norms': module_grad_norms,
+                }
 
             total_loss += loss.item()
             num_finite_loss += 1
+            has_extra_metrics = (
+                metrics['kd'] is not None
+                or metrics['cons'] is not None
+                or metrics['anti'] is not None
+                or metrics['conf'] is not None
+            )
+            if has_extra_metrics:
+                sup_loss = metrics['sup'].detach()
+                if torch.isfinite(sup_loss):
+                    total_sup_loss += sup_loss.item()
+                    num_sup_loss += 1
 
-            if i % self.print_freq == 0:
+            if log_this_iter:
                 self._log_train_iter(
                     epoch,
                     i,
@@ -551,7 +678,11 @@ class Trainer(object):
                     loss,
                     metrics,
                     start,
+                    grad_stats,
                 )
+
+        if num_sup_loss > 0:
+            self.last_train_sup_loss = total_sup_loss / num_sup_loss
 
         return total_loss / max(num_finite_loss, 1)
 
@@ -641,16 +772,45 @@ class Trainer(object):
             file_path,
         )
 
+    def _apply_backbone_freeze(self):
+        """[V4-FrozenBackbone] 每个 epoch 开始前强制冻结 TCN backbone。
+
+        与 frontend warmup 不同，这里是“训练全程冻”，不会解冻。
+        要求 model 暴露 freeze_backbone() 方法。
+        """
+        if not self.freeze_backbone_full:
+            return
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if not hasattr(model, 'freeze_backbone'):
+            return
+        # 仅首次冻结时打印日志，避免每个 epoch 刷屏。
+        already_logged = getattr(self, '_backbone_freeze_logged', False)
+        changed = model.freeze_backbone(freeze=True)
+        if not already_logged:
+            self.logger.info(
+                '-> [Backbone Freeze] TCN backbone permanently frozen '
+                '(%d params switched to requires_grad=False).' % changed
+            )
+            self._backbone_freeze_logged = True
+
     def train(self):
         for epoch in range(self.start_epoch, self.epochs):
             self._apply_frontend_schedule(epoch)
+            self._apply_backbone_freeze()
 
-            optim_state = self.optimizer.state_dict()
-            self.logger.info(
-                'epoch start Learning rate: {lr:.6f}'.format(
-                    lr=optim_state['param_groups'][0]['lr']
+            lr_parts = []
+            for group_idx, param_group in enumerate(self.optimizer.param_groups):
+                group_name = param_group.get('name', 'group%d' % group_idx)
+                lr_parts.append('%s=%.6f' % (group_name, param_group['lr']))
+            if any('name' in group for group in self.optimizer.param_groups):
+                self.logger.info(
+                    'epoch start Learning rate: %s' % ', '.join(lr_parts)
                 )
-            )
+            else:
+                self.logger.info(
+                    'epoch start Learning rate: %.6f'
+                    % self.optimizer.param_groups[0]['lr']
+                )
             self.logger.info("Training...")
 
             # ===== Training stage =====
@@ -667,6 +827,14 @@ class Trainer(object):
                     tr_loss,
                 )
             )
+            if self.last_train_sup_loss is not None:
+                self.logger.info(
+                    'Train Sup Summary | End of Epoch {0:5d} | '
+                    'Train Sup Loss {1:.3f}'.format(
+                        epoch + 1,
+                        self.last_train_sup_loss,
+                    )
+                )
             self.logger.info('-' * 85)
 
             if self.checkpoint:

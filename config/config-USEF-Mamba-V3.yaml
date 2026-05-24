@@ -1,0 +1,115 @@
+optimizer: !name:torch.optim.Adam
+  lr: 0.0001
+  weight_decay: 0
+
+checkpoint: 1
+# Mamba 后端 + USEF 前端 = TCN-V2 前端结构完全相同，直接复用 for_tcn_v2 抽取
+continue_from: 'chkpt/init_frontend_from_sepformer_wsj0-2mix_for_tcn_v2.pth.tar'
+max_norm: 5
+use_amp: True
+amp_dtype: bfloat16
+print_freq: 100
+name: USEF-Mamba-V3/wsj0-2mix
+
+# 前端保护：Mamba-2 backend 是随机初始化，前端是从 SepFormer 抽出来的稳定 init。
+# freeze 5 epoch 让 backend 先适应再放前端，scale 0.1 后前端只做轻微微调，
+# separate_frontend_backend_lr=True 保证 backend 学习率不被一起拉低。
+freeze_frontend_warmup: True
+frontend_warmup_epochs: 5
+frontend_unfreeze_lr_scale: 0.1
+separate_frontend_backend_lr: True
+
+epochs: 200
+batch_size: 8
+num_workers: 8
+valid_batch_size: 1
+num_spks: 1
+
+duration: 4
+sample_rate: 8000
+valid_chunk_duration: 4
+valid_chunk_hop_duration: 4
+valid_wake_aux_duration: 3
+
+dataset_type: wsj0-2mix
+train_path: data/train/wsj0-2mix
+valid_path: data/dev/wsj0-2mix
+test_path: data/test/wsj0-2mix
+
+mix_scp: mix.scp
+ref_scp: ref.scp
+aux_scp: aux.scp
+
+# Encoder parameters - 与 TCN-V2 / Mamba-V2 完全对齐方便对比
+N_encoder_out: 256
+out_channels: 256
+encoder_kernel_size: 16
+encoder_kernel_stride: 8
+embd: 256
+
+# Mamba-2 backend parameters
+# 12 层 bidirectional Mamba-2（之前 8 层），加深以提升非线性表达能力。
+# backend 内部已对 (fwd+bwd) 做 1/sqrt(2) 缩放、对 skip_sum 做 1/sqrt(N) 缩放。
+# d_state=128 是 Mamba-2 的常用值（Mamba-1 默认 16，d_state=64 在 Mamba-2 里偏小）
+# headdim=64：(out_channels*expand) / headdim = 512/64 = 8 个 head，必须整除
+mamba_num_layers: 12
+mamba_d_state: 128
+mamba_d_conv: 4
+mamba_expand: 2
+mamba_headdim: 64
+mamba_dropout: 0.0
+skip_channels: 256
+
+mask_activation: sigmoid
+# fln (Frame-wise LN): per-frame normalization across channels, no temporal
+# history — fully streamable, length-agnostic, zero cold-start instability.
+# Modern streaming TSE (DPMamba/SepMamba/TFGridNet) all use fLN, not cLN.
+# V3's CumulativeLayerNorm class is kept for an ablation row in the paper.
+norm: fln
+
+lambda_anti: 0.0
+anti_sisnr_margin: 0.0
+lambda_confusion: 0.0
+confusion_margin: 0.0
+
+Encoder: !new:models.model_USEF_Mamba_V3.Encoder
+  kernel_size: !ref <encoder_kernel_size>
+  out_channels: !ref <N_encoder_out>
+
+Decoder: !new:models.model_USEF_Mamba_V3.Decoder
+  in_channels: !ref <N_encoder_out>
+  out_channels: 1
+  kernel_size: !ref <encoder_kernel_size>
+  stride: !ref <encoder_kernel_stride>
+  bias: False
+
+Fusion_mdl: !new:models.local.TransformerEncoderCross.TransformerEncoderCross
+  num_layers: 4
+  d_model: !ref <out_channels>
+  nhead: 8
+  d_ffn: 1024
+  dropout: 0
+
+FiLM: !new:models.model_USEF_Mamba_V3.FiLM
+  size: !ref <out_channels>
+
+MaskNet: !new:models.model_USEF_Mamba_V3.Tar_Model
+  encoder: !ref <Encoder>
+  decoder: !ref <Decoder>
+  fusion_mdl: !ref <Fusion_mdl>
+  film: !ref <FiLM>
+  in_channels: !ref <N_encoder_out>
+  out_channels: !ref <out_channels>
+  num_spks: !ref <num_spks>
+  mamba_num_layers: !ref <mamba_num_layers>
+  mamba_d_state: !ref <mamba_d_state>
+  mamba_d_conv: !ref <mamba_d_conv>
+  mamba_expand: !ref <mamba_expand>
+  mamba_headdim: !ref <mamba_headdim>
+  mamba_dropout: !ref <mamba_dropout>
+  skip_channels: !ref <skip_channels>
+  mask_activation: !ref <mask_activation>
+  norm: !ref <norm>
+
+modules:
+  masknet: !ref <MaskNet>
