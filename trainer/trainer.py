@@ -196,9 +196,23 @@ class Trainer(object):
         cont = torch.load(self.continue_from, weights_only=False)
         self.start_epoch = 0 if self.reset_epoch_on_continue else cont.get('epoch', 0)
 
-        # 通用迁移学习：strict=False 允许只加载形状匹配的旧权重。
-        # V4 新增 adapter 没有旧权重，会保持随机/零初始化；TCN 主干可从旧模型继承。
-        self.model.load_state_dict(cont['model_state_dict'], strict=False)
+        # 统一对 unwrapped model 加载，兼容两种 checkpoint 格式：
+        # 1) 训练 checkpoint：key 带 "module." 前缀（DataParallel 保存）
+        # 2) 抽取 checkpoint：key 是裸的（如 encoder.conv1d.weight）
+        raw_state = cont['model_state_dict']
+        has_module_prefix = any(k.startswith('module.') for k in raw_state.keys())
+        if has_module_prefix:
+            state_dict = {k.removeprefix('module.'): v for k, v in raw_state.items()}
+        else:
+            state_dict = raw_state
+
+        model_unwrapped = self.model.module if hasattr(self.model, 'module') else self.model
+        load_result = model_unwrapped.load_state_dict(state_dict, strict=False)
+
+        # 记录实际加载了哪些顶层模块，供 _frontend_modules() 动态决定冻结范围。
+        loaded_keys = set(state_dict.keys()) - set(load_result.unexpected_keys)
+        self._loaded_toplevel_modules = {k.split('.')[0] for k in loaded_keys if '.' in k}
+        print("从 checkpoint 加载到的顶层模块: %s" % sorted(self._loaded_toplevel_modules))
 
         # ===== TCCTCN-V2：迁移旧模型时重置 target-conditioned path =====
         if self.reset_tc_conditioning_on_continue:
@@ -266,88 +280,20 @@ class Trainer(object):
     # 通用迁移学习：前端冻结/解冻 warm-up
     # -------------------------------------------------------------------------
     def _frontend_modules(self):
-        """返回需要 warm-up 冻结的前端模块，兼容 DataParallel。"""
+        """返回需要 warm-up 冻结的前端模块，兼容 DataParallel。
+        动态策略：只冻结从 checkpoint 实际加载到权重的顶层模块。
+        如果没有加载记录（如无 continue_from），回退到空列表。
+        """
         model = self.model.module if hasattr(self.model, 'module') else self.model
+        loaded = getattr(self, '_loaded_toplevel_modules', None)
+        if not loaded:
+            return []
         modules = []
-        for name in ('encoder', 'decoder', 'conv1d1', 'fusion_mdl', 'fusion_norm', 'film'):
+        for name in loaded:
             module = getattr(model, name, None)
             if module is not None:
                 modules.append(module)
         return modules
-
-    def _grad_norm_for_params(self, params):
-        """Return the pre-clipping L2 grad norm for a parameter iterable."""
-        norms = []
-        with torch.no_grad():
-            for param in params:
-                if param.grad is None:
-                    continue
-                grad = param.grad.detach()
-                if grad.is_sparse:
-                    grad = grad.coalesce().values()
-                norms.append(torch.linalg.vector_norm(grad.float(), 2).cpu())
-
-            if not norms:
-                return None
-            return float(torch.linalg.vector_norm(torch.stack(norms), 2).item())
-
-    def _module_grad_norms(self):
-        """Collect pre-clipping grad norms for coarse model regions."""
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        groups = (
-            ('enc', ('encoder',)),
-            ('dec', ('decoder',)),
-            ('pre', ('norm_m', 'conv1d1')),
-            ('fusion', ('fusion_mdl', 'fusion_norm')),
-            ('film', ('film',)),
-            ('backend', ('backend', 'tcn_backend')),
-            ('head', ('skip_prelu', 'skip_norm', 'mask_conv1x1')),
-        )
-
-        module_norms = []
-        used_param_ids = set()
-        for group_name, module_names in groups:
-            params = []
-            for module_name in module_names:
-                module = getattr(model, module_name, None)
-                if module is None:
-                    continue
-                for param in module.parameters():
-                    param_id = id(param)
-                    if param_id in used_param_ids:
-                        continue
-                    params.append(param)
-                    used_param_ids.add(param_id)
-            if params:
-                module_norms.append((group_name, self._grad_norm_for_params(params)))
-
-        other_params = [
-            param for param in model.parameters()
-            if id(param) not in used_param_ids
-        ]
-        other_norm = self._grad_norm_for_params(other_params)
-        if other_norm is not None:
-            module_norms.append(('other', other_norm))
-
-        return module_norms
-
-    def _clip_ratio_from_grad_norm(self, grad_norm):
-        if grad_norm <= 0:
-            return 1.0
-        if not np.isfinite(grad_norm):
-            return 0.0
-        return min(1.0, float(self.max_norm) / (grad_norm + 1e-12))
-
-    def _format_module_grad_norms(self, module_grad_norms):
-        if not module_grad_norms:
-            return 'ModuleGradNorms none'
-        parts = []
-        for name, value in module_grad_norms:
-            if value is None:
-                parts.append('%s=-' % name)
-            else:
-                parts.append('%s=%.3f' % (name, value))
-        return 'ModuleGradNorms ' + ', '.join(parts)
 
     def _freeze_frontend(self):
         """[通用 warm-up] 冻结前端模块，仅训练后端或新加模块。"""
@@ -543,16 +489,7 @@ class Trainer(object):
 
         return loss, metrics
 
-    def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start, grad_stats):
-        if grad_stats is None:
-            clip_ratio = 1.0
-            module_grad_text = self._format_module_grad_norms(None)
-        else:
-            clip_ratio = grad_stats['clip_ratio']
-            module_grad_text = self._format_module_grad_norms(
-                grad_stats['module_grad_norms']
-            )
-
+    def _log_train_iter(self, epoch, i, average_loss, loss, metrics, start, grad_norm):
         if (
             metrics['kd'] is None
             and metrics['cons'] is None
@@ -561,14 +498,13 @@ class Trainer(object):
         ):
             self.logger.info(
                 'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
-                'Current Loss {3:3.6f} | ClipRatio {4:3.3f} | {5} | '
-                '{6:5.1f} ms/batch'.format(
+                'Current Loss {3:3.6f} | GradNorm {4:3.3f} | '
+                '{5:5.1f} ms/batch'.format(
                     epoch + 1,
                     i + 1,
                     average_loss,
                     loss.item(),
-                    clip_ratio,
-                    module_grad_text,
+                    grad_norm,
                     1000 * (time.time() - start) / (i + 1),
                 )
             )
@@ -582,7 +518,7 @@ class Trainer(object):
             'Epoch {0:3d} | Iter {1:5d} | Average Loss {2:3.3f} | '
             'Current Loss {3:3.6f} | Sup {4:3.6f} | KD {5:3.6f} | '
             'Cons {6:3.6f} | Anti {7:3.6f} | Conf {8:3.6f} | '
-            'ClipRatio {9:3.3f} | {10} | {11:5.1f} ms/batch'.format(
+            'GradNorm {9:3.3f} | {10:5.1f} ms/batch'.format(
                 epoch + 1,
                 i + 1,
                 average_loss,
@@ -592,8 +528,7 @@ class Trainer(object):
                 cons_value,
                 anti_value,
                 conf_value,
-                clip_ratio,
-                module_grad_text,
+                grad_norm,
                 1000 * (time.time() - start) / (i + 1),
             )
         )
@@ -624,15 +559,10 @@ class Trainer(object):
                 )
                 continue
 
-            log_this_iter = i % self.print_freq == 0
-            module_grad_norms = None
-
             self.optimizer.zero_grad(set_to_none=True)
             if self.grad_scaler.is_enabled():
                 self.grad_scaler.scale(loss).backward()
                 self.grad_scaler.unscale_(self.optimizer)
-                if log_this_iter:
-                    module_grad_norms = self._module_grad_norms()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.max_norm,
@@ -641,20 +571,12 @@ class Trainer(object):
                 self.grad_scaler.update()
             else:
                 loss.backward()
-                if log_this_iter:
-                    module_grad_norms = self._module_grad_norms()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.max_norm,
                 )
                 self.optimizer.step()
             grad_norm = float(grad_norm.detach().cpu())
-            grad_stats = None
-            if log_this_iter:
-                grad_stats = {
-                    'clip_ratio': self._clip_ratio_from_grad_norm(grad_norm),
-                    'module_grad_norms': module_grad_norms,
-                }
 
             total_loss += loss.item()
             num_finite_loss += 1
@@ -670,7 +592,7 @@ class Trainer(object):
                     total_sup_loss += sup_loss.item()
                     num_sup_loss += 1
 
-            if log_this_iter:
+            if i % self.print_freq == 0:
                 self._log_train_iter(
                     epoch,
                     i,
@@ -678,7 +600,7 @@ class Trainer(object):
                     loss,
                     metrics,
                     start,
-                    grad_stats,
+                    grad_norm,
                 )
 
         if num_sup_loss > 0:
@@ -798,19 +720,12 @@ class Trainer(object):
             self._apply_frontend_schedule(epoch)
             self._apply_backbone_freeze()
 
-            lr_parts = []
-            for group_idx, param_group in enumerate(self.optimizer.param_groups):
-                group_name = param_group.get('name', 'group%d' % group_idx)
-                lr_parts.append('%s=%.6f' % (group_name, param_group['lr']))
-            if any('name' in group for group in self.optimizer.param_groups):
-                self.logger.info(
-                    'epoch start Learning rate: %s' % ', '.join(lr_parts)
+            optim_state = self.optimizer.state_dict()
+            self.logger.info(
+                'epoch start Learning rate: {lr:.6f}'.format(
+                    lr=optim_state['param_groups'][0]['lr']
                 )
-            else:
-                self.logger.info(
-                    'epoch start Learning rate: %.6f'
-                    % self.optimizer.param_groups[0]['lr']
-                )
+            )
             self.logger.info("Training...")
 
             # ===== Training stage =====

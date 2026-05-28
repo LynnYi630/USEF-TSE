@@ -22,12 +22,12 @@ Use the generated output directory as teacher_cache_dir in WRCD configs.
 
 To generate teacher caches:
     python3 tools/generate_teacher_cache.py \
-      --config config/config-USEF-SepFormer.yaml \
-      --chkpt-path chkpt/USEF-SepFormer/libri2mix/best.pth.tar \
-      --data-path data/train/libri2mix \
-      --output-dir teacher_cache/USEF-SepFormer/libri2mix/train \
+      --config config/config-USEF-TFGridNet.yaml \
+      --chkpt-path chkpt/USEF-TFGridNet/wsj0-2mix/best.pth.tar \
+      --data-path data/train/wsj0-2mix \
+      --output-dir teacher_cache/USEF-TFGridNet/wsj0-2mix/aux_3 \
       --device cuda:0 \
-      --max-aux-duration 4 \
+      --max-aux-duration 3 \
       --overwrite
 
 Notes:

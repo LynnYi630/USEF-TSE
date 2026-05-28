@@ -1,25 +1,19 @@
 optimizer: !name:torch.optim.Adam
-  lr: 0.0001
+  lr: 0.00005
   weight_decay: 0
 
 checkpoint: 1
-# Mamba 后端 + USEF 前端 = TCN-V2 前端结构完全相同，直接复用 for_tcn_v2 抽取
-continue_from: 'chkpt\init_frontend_for_mamba.pth.tar'
+continue_from: 'chkpt/USEF-Mamba-V3/wsj0-2mix/temp_best.pth.tar'
+reset_epoch_on_continue: True
 max_norm: 5
 use_amp: True
 amp_dtype: bfloat16
 print_freq: 100
-name: USEF-Mamba-V3/wsj0-2mix
+name: USEF-Mamba-V3-CurrAux-FT-KD-Aux3/wsj0-2mix
 
-# 前端保护：Mamba-2 backend 是随机初始化，前端是从 SepFormer 抽出来的稳定 init。
-# freeze 5 epoch 让 backend 先适应再放前端，scale 0.1 后前端只做轻微微调，
-# separate_frontend_backend_lr=True 保证 backend 学习率不被一起拉低。
-freeze_frontend_warmup: True
-frontend_warmup_epochs: 5
-frontend_unfreeze_lr_scale: 0.1
-separate_frontend_backend_lr: True
+freeze_frontend_warmup: False
 
-epochs: 200
+epochs: 100
 batch_size: 8
 num_workers: 8
 valid_batch_size: 1
@@ -29,7 +23,7 @@ duration: 4
 sample_rate: 8000
 valid_chunk_duration: 4
 valid_chunk_hop_duration: 4
-valid_wake_aux_duration: 3
+valid_wake_aux_duration: 1
 
 dataset_type: wsj0-2mix
 train_path: data/train/wsj0-2mix
@@ -40,7 +34,18 @@ mix_scp: mix.scp
 ref_scp: ref.scp
 aux_scp: aux.scp
 
-# Encoder parameters - 与 TCN-V2 / Mamba-V2 完全对齐方便对比
+# Short wake/enrollment aux + waveform teacher distillation.
+# Dual-aux consistency is intentionally disabled.
+use_short_aux: True
+train_wake_aux_min_duration: 0.5
+train_wake_aux_max_duration: 1.5
+use_wrcd: True
+use_wrcd_consistency: False
+teacher_cache_dir: teacher_cache/USEF-TFGridNet/wsj0-2mix/aux_3
+lambda_kd: 0.2
+lambda_cons: 0.0
+
+# Encoder parameters
 N_encoder_out: 256
 out_channels: 256
 encoder_kernel_size: 16
@@ -48,10 +53,6 @@ encoder_kernel_stride: 8
 embd: 256
 
 # Mamba-2 backend parameters
-# 12 层 bidirectional Mamba-2（之前 8 层），加深以提升非线性表达能力。
-# backend 内部已对 (fwd+bwd) 做 1/sqrt(2) 缩放、对 skip_sum 做 1/sqrt(N) 缩放。
-# d_state=128 是 Mamba-2 的常用值（Mamba-1 默认 16，d_state=64 在 Mamba-2 里偏小）
-# headdim=64：(out_channels*expand) / headdim = 512/64 = 8 个 head，必须整除
 mamba_num_layers: 12
 mamba_d_state: 128
 mamba_d_conv: 4
@@ -61,10 +62,6 @@ mamba_dropout: 0.0
 skip_channels: 256
 
 mask_activation: sigmoid
-# fln (Frame-wise LN): per-frame normalization across channels, no temporal
-# history — fully streamable, length-agnostic, zero cold-start instability.
-# Modern streaming TSE (DPMamba/SepMamba/TFGridNet) all use fLN, not cLN.
-# V3's CumulativeLayerNorm class is kept for an ablation row in the paper.
 norm: fln
 
 lambda_anti: 0.0
